@@ -71,6 +71,13 @@ static uint16_t volvo_ecm_1_addr;
 static uint16_t volvo_bus1_cruise_control_addr;
 static bool volvo_c1;
 
+// Always On Lateral off->on->off tap detection
+#define VOLVO_AOL_ENTRY_WINDOW_US 500000U  // 0.5s
+static bool volvo_aol_armed = false;
+static bool volvo_aol_seen_rising = false;
+static bool volvo_aol_cruise_prev = false;
+static uint32_t volvo_aol_rising_ts = 0U;
+
 #define VOLVO_STOCK_LCA5_FRAMES 4U
 #define VOLVO_STOCK_LCA5_MAX_AGE_US 100000U
 static uint8_t volvo_stock_lca5_data[VOLVO_STOCK_LCA5_FRAMES][8];
@@ -234,6 +241,33 @@ static void volvo_rx_hook(const CANPacket_t *msg) {
         // SPA: SG_ CRUISE_CONTROL_SPA_ENABLED : 1|1@0+ (-1,1) — byte 0 bit 1, active low
         cruise_enabled = !((msg->data[0] >> 1) & 1U);
       }
+
+      if ((alternative_experience & ALT_EXP_ALWAYS_ON_LATERAL) != 0U) {
+        bool rising = cruise_enabled && !volvo_aol_cruise_prev;
+        bool falling = !cruise_enabled && volvo_aol_cruise_prev;
+        uint32_t ts = microsecond_timer_get();
+        if (!volvo_aol_armed) {
+          if (rising) {
+            volvo_aol_rising_ts = ts;
+            volvo_aol_seen_rising = true;
+          } else if (falling && volvo_aol_seen_rising && (safety_get_ts_elapsed(ts, volvo_aol_rising_ts) <= VOLVO_AOL_ENTRY_WINDOW_US)) {
+            volvo_aol_armed = true;
+          } else {
+            // normal press outside the entry window: no state change
+          }
+        } else if (falling || rising) {
+          volvo_aol_armed = false;
+          volvo_aol_seen_rising = false;
+        } else {
+          // no edge this frame: remain armed
+        }
+        volvo_aol_cruise_prev = cruise_enabled;
+        acc_main_on = volvo_aol_armed;
+      } else {
+        volvo_aol_armed = false;
+        volvo_aol_cruise_prev = cruise_enabled;
+      }
+
       pcm_cruise_check(cruise_enabled);
     }
   }
@@ -298,7 +332,7 @@ static bool volvo_tx_hook(const CANPacket_t *msg) {
     } else {
       const int desired_angle = volvo_lca_5_angle(msg);
       tx &= SAFETY_ABS(desired_angle) <= VOLVO_MAX_ANGLE_CAN;
-      tx &= !steer_angle_cmd_checks(desired_angle, controls_allowed, VOLVO_ANGLE_STEERING_LIMITS);
+      tx &= !steer_angle_cmd_checks(desired_angle, aol_allowed || controls_allowed, VOLVO_ANGLE_STEERING_LIMITS);
     }
   }
 
@@ -395,6 +429,9 @@ static safety_config volvo_init(uint16_t param) {
   for (uint8_t i = 0U; i < VOLVO_STOCK_LCA5_FRAMES; i++) {
     volvo_stock_lca5_valid[i] = false;
   }
+  volvo_aol_armed = false;
+  volvo_aol_seen_rising = false;
+  volvo_aol_cruise_prev = false;
 
   if (volvo_c1) {
     static const CanMsg VOLVO_C1_TX_MSGS[] = {

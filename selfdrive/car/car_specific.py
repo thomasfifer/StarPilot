@@ -210,6 +210,9 @@ class CarSpecificEvents:
     elif self.CP.brand == 'nissan':
       events = self.create_common_events(CS, CS_prev, extra_gears=extra_gears, pcm_enable=self.CP.pcmCruise)
 
+    elif self.CP.brand == 'volvo':
+      events = self.create_common_events(CS, CS_prev, extra_gears=extra_gears, ignore_cruise_state=True)
+
     else:
       events = self.create_common_events(CS, CS_prev, extra_gears=extra_gears)
 

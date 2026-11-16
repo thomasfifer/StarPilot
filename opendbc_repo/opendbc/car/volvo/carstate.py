@@ -4,6 +4,7 @@ from opendbc.can.parser import CANParser
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.interfaces import CarStateBase
 from opendbc.car.volvo.values import CAR, DBC, VolvoC1PlatformConfig, VolvoSPAPlatformConfig
+from opendbc.safety import ALTERNATIVE_EXPERIENCE
 
 GearShifter = structs.CarState.GearShifter
 TransmissionType = structs.CarParams.TransmissionType
@@ -12,6 +13,7 @@ TransmissionType = structs.CarParams.TransmissionType
 # Must match VOLVO_SPEED_TO_MS in opendbc/safety/modes/volvo.h.
 SPEED_TO_MS = 0.003977
 STEERING_PRESSED_THRESHOLD = 2
+AOL_MAIN_ENTRY_WINDOW_FRAMES = 50 # 0.5s
 
 
 class CarState(CarStateBase):
@@ -20,6 +22,11 @@ class CarState(CarStateBase):
     self.is_c1 = isinstance(CAR(CP.carFingerprint).config, VolvoC1PlatformConfig)
     self.is_spa = isinstance(CAR(CP.carFingerprint).config, VolvoSPAPlatformConfig)
     self.gas_pressed_prev = False
+    self.aol_frame = 0
+    self.aol_cruise_prev = False
+    self.aol_seen_rising = False
+    self.aol_rising_frame = 0
+    self.aol_armed = False
     self.dispatch_lca_2_msg = False
     self.msg_pscm = {}
     self.msg_lca = {}
@@ -106,8 +113,25 @@ class CarState(CarStateBase):
 
     ret.cruiseState.enabled = cruise_raw
 
+    self.aol_frame += 1
+    if bool(self.CP.alternativeExperience & ALTERNATIVE_EXPERIENCE.ALWAYS_ON_LATERAL):
+      cruise_rising = cruise_raw and not self.aol_cruise_prev
+      cruise_falling = (not cruise_raw) and self.aol_cruise_prev
+      if not self.aol_armed:
+        if cruise_rising:
+          self.aol_rising_frame = self.aol_frame
+          self.aol_seen_rising = True
+        elif cruise_falling and self.aol_seen_rising and (self.aol_frame - self.aol_rising_frame) <= AOL_MAIN_ENTRY_WINDOW_FRAMES:
+          self.aol_armed = True
+      elif cruise_falling or cruise_rising:
+        self.aol_armed = False
+        self.aol_seen_rising = False
+      self.aol_cruise_prev = cruise_raw
+      ret.cruiseState.available = self.aol_armed
+    else:
+      ret.cruiseState.available = True  # TODO: Determine actual availability
+
     self.gas_pressed_prev = ret.gasPressed
-    ret.cruiseState.available = True  # TODO: Determine actual availability
     ret.cruiseState.speed = 0  # TODO: Find cruise set speed (not required for lateral control)
     ret.cruiseState.nonAdaptive = False
     ret.cruiseState.standstill = ret.standstill # False # Todo: Find cruise control standstill signal

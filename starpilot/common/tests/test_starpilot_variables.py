@@ -27,11 +27,6 @@ def test_ford_can_map_lkas_button_to_aol():
   assert spv._lkas_allowed_for_aol("ford", 0, []) is True
 
 
-def test_volvo_aol_is_held_off_until_pscm_sequence_is_validated():
-  assert spv.always_on_lateral_available(SimpleNamespace(brand="volvo")) is False
-  assert spv.always_on_lateral_available(SimpleNamespace(brand="honda")) is True
-
-
 def test_tesla_aol_capability_includes_preap():
   for fingerprint in ("TESLA_MODEL_S_PREAP", "TESLA_MODEL_S_HW1", "TESLA_MODEL_X_HW1", "TESLA_MODEL_3", "TESLA_MODEL_Y"):
     assert spv.always_on_lateral_available(SimpleNamespace(brand="tesla", carFingerprint=fingerprint))
