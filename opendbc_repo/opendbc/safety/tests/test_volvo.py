@@ -26,9 +26,13 @@ import unittest
 from opendbc.car.volvo.interface import SAFETY_VOLVO
 from opendbc.car.volvo.values import VolvoSafetyFlags
 from opendbc.car.volvo.volvocan import create_c1_checksum, create_c1_steering_control
+from opendbc.safety import ALTERNATIVE_EXPERIENCE
 from opendbc.safety.tests.libsafety import libsafety_py
 import opendbc.safety.tests.common as common
 from opendbc.safety.tests.common import CANPackerSafety
+
+# Must match VOLVO_AOL_ENTRY_WINDOW_US in volvo.h and AOL_MAIN_ENTRY_WINDOW_FRAMES (50 frames @ 100Hz) in carstate.py.
+VOLVO_AOL_ENTRY_WINDOW_US = 500000
 
 
 # Must match the flags in opendbc/safety/modes/volvo.h
@@ -139,6 +143,16 @@ class TestVolvoSafetyBase(common.CarSafetyTest):
   def _angle_meas_msg(self, angle):
     return self.mid_packer.make_can_msg_safety(
       "PSCM", VOLVO_PARTY_BUS, {"PSCM_ANGLE_SENSOR": angle})
+
+  def _toggle_aol(self, toggle_on):
+    #Jump the mocked timer well clear of any earlier call's window first
+    self._aol_tap_time = getattr(self, "_aol_tap_time", 0) + 10_000_000
+    self.safety.set_timer(self._aol_tap_time)
+    if toggle_on: #AOL main-cruise mode is armed by an off->on->off tap
+      self._rx(self._pcm_status_msg(False))
+      self._rx(self._pcm_status_msg(True))
+      return self._pcm_status_msg(False)
+    return self._pcm_status_msg(True)
 
   def _angle_cmd_msg(self, angle):
     return self.mid_packer.make_can_msg_safety(
@@ -345,6 +359,114 @@ class TestVolvoSafetyBase(common.CarSafetyTest):
       self.assertIsNotNone(m, f"could not find the speed LSB in {name}")
       self.assertEqual(float(m.group(1)), VOLVO_SPEED_TO_MS,
                        f"{name} speed LSB disagrees with test_volvo.py")
+
+  # ---- AOL main-cruise tap-timing tests ----
+
+  def test_aol_fast_tap_arms(self):
+    """An off->on->off tap completed within the entry window arms AOL."""
+    self.safety.set_alternative_experience(ALTERNATIVE_EXPERIENCE.ALWAYS_ON_LATERAL)
+    self.safety.set_timer(0)
+    self._rx(self._pcm_status_msg(False))
+    self.assertFalse(self.safety.get_acc_main_on())
+
+    self.safety.set_timer(100000)
+    self._rx(self._pcm_status_msg(True))
+    self.assertFalse(self.safety.get_acc_main_on(), "must not arm on the rising half alone")
+
+    self.safety.set_timer(100000 + 200000)  # 0.2s later, within the 0.5s window
+    self._rx(self._pcm_status_msg(False))
+    self.assertTrue(self.safety.get_acc_main_on())
+
+  def test_aol_slow_tap_does_not_arm(self):
+    """An off->on->off tap that takes longer than the entry window does not arm AOL."""
+    self.safety.set_alternative_experience(ALTERNATIVE_EXPERIENCE.ALWAYS_ON_LATERAL)
+    self.safety.set_timer(0)
+    self._rx(self._pcm_status_msg(False))
+
+    self.safety.set_timer(100000)
+    self._rx(self._pcm_status_msg(True))
+
+    self.safety.set_timer(100000 + VOLVO_AOL_ENTRY_WINDOW_US + 100000)  # 0.1s past the window
+    self._rx(self._pcm_status_msg(False))
+    self.assertFalse(self.safety.get_acc_main_on())
+
+  def test_aol_single_rising_edge_disarms_while_armed(self):
+    """Once armed, a bare on-press (no matching off yet) disarms immediately."""
+    self.safety.set_alternative_experience(ALTERNATIVE_EXPERIENCE.ALWAYS_ON_LATERAL)
+    self.safety.set_timer(0)
+    self._rx(self._pcm_status_msg(False))
+    self.safety.set_timer(100000)
+    self._rx(self._pcm_status_msg(True))
+    self.safety.set_timer(100000 + 200000)
+    self._rx(self._pcm_status_msg(False))
+    self.assertTrue(self.safety.get_acc_main_on())
+
+    self.safety.set_timer(100000 + 210000)
+    self._rx(self._pcm_status_msg(True))
+    self.assertFalse(self.safety.get_acc_main_on())
+
+  def test_aol_brake_induced_cancel_after_disarm_does_not_rearm(self):
+    """
+    Disarming AOL with a single on-press, then having the car's own stock ACC
+    auto-cancel (a brake-induced falling edge) shortly after, must not be mistaken for
+    a fresh off->on->off tap using the stale timestamp of the *original* arming tap.
+    Regression guard: aol_seen_rising must be cleared on disarm, not just acc_main_on.
+    """
+    self.safety.set_alternative_experience(ALTERNATIVE_EXPERIENCE.ALWAYS_ON_LATERAL)
+    self.safety.set_timer(0)
+    self._rx(self._pcm_status_msg(False))
+    self.safety.set_timer(100000)
+    self._rx(self._pcm_status_msg(True))
+    self.safety.set_timer(100000 + 200000)
+    self._rx(self._pcm_status_msg(False))
+    self.assertTrue(self.safety.get_acc_main_on())
+
+    # Single on-press disarms it immediately.
+    self.safety.set_timer(100000 + 210000)
+    self._rx(self._pcm_status_msg(True))
+    self.assertFalse(self.safety.get_acc_main_on())
+
+    # Soon after (well within the original tap's 0.5s window), the brake auto-cancels
+    # stock cruise. Must stay disarmed, not resurrect the stale original-arm timestamp.
+    self.safety.set_timer(100000 + 220000)
+    self._rx(self._pcm_status_msg(False))
+    self.assertFalse(self.safety.get_acc_main_on())
+
+  def test_aol_armed_allows_steering_command(self):
+    """
+    Regression guard: arming AOL (acc_main_on) must actually unblock the real steering
+    command (LCA_5), not just the generic aol_allowed/acc_main_on bookkeeping. volvo_tx_hook
+    has its own independent angle check for LCA_5 separate from the generic lateral.h AOL
+    consumers, so it must be told about aol_allowed explicitly -- it does not get it for free.
+    controls_allowed stays False throughout: AOL grants lateral authority without ever
+    setting it, since that's tied to normal longitudinal engagement.
+    """
+    self._reset_angle_measurement(0)
+    self._reset_speed_measurement(10)
+    self.safety.set_controls_allowed(False)
+    # Small enough that only the controls/aol-allowed gate is in play, not the
+    # separate (and separately tested) per-cycle rate limiter.
+    small_angle = 1.0
+
+    # Without AOL, a steering command away from the measured angle is blocked.
+    self.safety.set_desired_angle_last(0)
+    self.assertFalse(self._tx(self._angle_cmd_msg(small_angle)))
+    self.assertFalse(self.safety.get_controls_allowed())
+
+    # Arm AOL via the off->on->off tap (same as test_aol_fast_tap_arms).
+    self.safety.set_alternative_experience(ALTERNATIVE_EXPERIENCE.ALWAYS_ON_LATERAL)
+    self.safety.set_timer(0)
+    self._rx(self._pcm_status_msg(False))
+    self.safety.set_timer(100000)
+    self._rx(self._pcm_status_msg(True))
+    self.safety.set_timer(100000 + 200000)
+    self._rx(self._pcm_status_msg(False))
+    self.assertTrue(self.safety.get_acc_main_on())
+    self.assertFalse(self.safety.get_controls_allowed(), "AOL must not set controls_allowed")
+
+    # Now the same steering command away from measured must be allowed.
+    self.safety.set_desired_angle_last(0)
+    self.assertTrue(self._tx(self._angle_cmd_msg(small_angle)))
 
 
 class TestVolvoCMA(TestVolvoSafetyBase):

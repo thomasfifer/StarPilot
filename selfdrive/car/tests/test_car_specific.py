@@ -56,3 +56,14 @@ def test_kia_ray_ev_allows_stock_cruise_to_enable_controls():
 
     assert captured["pcm_enable"] is True
     assert captured["ignore_cruise_state"] is ignore_cruise_state
+
+
+def test_volvo_ignores_cruise_state_for_wrong_car_mode():
+  cp = SimpleNamespace(brand="volvo", carFingerprint="VOLVO_S60_RECHARGE", flags=0)
+  handler = CarSpecificEvents(cp)
+  captured = {}
+  handler.create_common_events = lambda *args, **kwargs: captured.update(kwargs)
+
+  handler.update(SimpleNamespace(), SimpleNamespace(), SimpleNamespace())
+
+  assert captured["ignore_cruise_state"] is True

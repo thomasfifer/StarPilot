@@ -75,7 +75,7 @@ THRESHOLD = 1 - 1 / math.e                # Requires the condition to be true fo
 
 NON_DRIVING_GEARS = [GearShifter.neutral, GearShifter.park, GearShifter.reverse, GearShifter.unknown]
 
-ALWAYS_ON_LATERAL_UNSUPPORTED_CAR_MAKES = frozenset({"volvo"})
+ALWAYS_ON_LATERAL_UNSUPPORTED_CAR_MAKES = frozenset()
 
 # Temporary fallback until the weather-compatible API is hosted locally.
 STARPILOT_API = os.getenv("STARPILOT_API", "https://frogpilot.com/api")
