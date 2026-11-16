@@ -199,7 +199,7 @@ class CarController(CarControllerBase):
       self.apply_angle_last = apply_angle
 
       # PSCM (bus 2 -> 0) - 0x16 - 100 Hz
-      can_sends.append(create_pscm_message(self.packer, lat_active, CS.msg_pscm, self.frame))
+      can_sends.append(create_pscm_message(self.packer, CS.msg_pscm, lat_active))
       # EGSM - 0x45 - 100 Hz
       #can_sends.append(create_egsm_message(self.packer, CS.msg_egsm))
 
