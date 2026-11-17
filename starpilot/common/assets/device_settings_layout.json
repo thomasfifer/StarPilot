@@ -3372,7 +3372,18 @@
         "picker_description": "Locks the selected fingerprint; disables auto-detection.",
         "data_type": "bool",
         "ui_type": "toggle",
+        "is_parent_toggle": true,
         "settings_tier": "simple"
+      },
+      {
+        "key": "SkipFwQuery",
+        "label": "Skip FW Query",
+        "description": "Skips the firmware/VIN probe that toggles panda's OBD multiplexing relay. WARNING: this probe is required for some brands. Skipping the query can silently disable features on some cars from Ford, Hyundai, Chrysler, Toyota, and Nissan.",
+        "picker_description": "Skips the firmware/VIN probe. Can disable trim-detection features on many cars -- only use if your harness needs it.",
+        "data_type": "bool",
+        "ui_type": "toggle",
+        "parent_key": "ForceFingerprint",
+        "settings_tier": "advanced"
       },
       {
         "key": "IsRHD",

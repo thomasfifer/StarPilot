@@ -383,6 +383,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"ForceAutoTune", {PERSISTENT, BOOL, "0", "0", 3}},
     {"ForceAutoTuneOff", {PERSISTENT, BOOL, "1", "0", 2}},
     {"ForceFingerprint", {PERSISTENT, BOOL, "0", "0", 2, SETTINGS_SIMPLE}},
+    {"SkipFwQuery", {PERSISTENT, BOOL, "0", "0", 2, SETTINGS_SIMPLE}},
     {"ForceOffroad", {CLEAR_ON_MANAGER_START, BOOL, "0", "0"}},
     {"ForceOnroad", {CLEAR_ON_MANAGER_START, BOOL, "0", "0"}},
     {"ForceStops", {PERSISTENT, BOOL, "1", "0", 2, SETTINGS_SIMPLE}},

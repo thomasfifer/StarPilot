@@ -264,6 +264,10 @@ def fingerprint(can_recv: CanRecvCallable, can_send: CanSendCallable, set_obd_mu
     skip_fw_query = True
     carlog.warning("NAPForcePreAP enabled; forcing TESLA_MODEL_S_PREAP fingerprint")
 
+  if not fixed_fingerprint and not skip_fw_query and Params().get_bool("ForceFingerprint") and Params().get_bool("SkipFwQuery"):
+    skip_fw_query = True
+    carlog.warning("ForceFingerprint + SkipFwQuery enabled; skipping FW/VIN query")
+
   start_time = time.monotonic()
   if not skip_fw_query:
     if cached_params is not None and cached_params.brand != "mock" and len(cached_params.carFw) > 0 and \
