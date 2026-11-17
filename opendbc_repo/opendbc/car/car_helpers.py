@@ -19,6 +19,9 @@ from openpilot.common.params import Params
 
 FRAME_FINGERPRINT = 100  # 1s
 
+# Some cars don't like the FW query, skip if make already set
+FORCE_FINGERPRINT_SKIP_FW_QUERY_MAKES = {"Volvo"}
+
 StarPilotCarParams = custom.StarPilotCarParams
 
 
@@ -263,6 +266,12 @@ def fingerprint(can_recv: CanRecvCallable, can_send: CanSendCallable, set_obd_mu
     fixed_fingerprint = "TESLA_MODEL_S_PREAP"
     skip_fw_query = True
     carlog.warning("NAPForcePreAP enabled; forcing TESLA_MODEL_S_PREAP fingerprint")
+
+  if not fixed_fingerprint and not skip_fw_query and Params().get_bool("ForceFingerprint"):
+    car_make = Params().get("CarMake", encoding="utf8") or ""
+    if car_make in FORCE_FINGERPRINT_SKIP_FW_QUERY_MAKES:
+      skip_fw_query = True
+      carlog.warning("ForceFingerprint enabled for %s; skipping FW/VIN query", car_make)
 
   start_time = time.monotonic()
   if not skip_fw_query:
