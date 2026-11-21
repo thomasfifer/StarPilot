@@ -1,10 +1,13 @@
 import unittest
 
+from opendbc.can.parser import CANParser
+
 from opendbc.car.volvo.helpers import (
   checksum_1_pscm_related_message,
   checksum_2_pscm_related_message,
   checksum_2_lca_2_message,
   checksum_lca_5_message,
+  pscm_status_supported,
 )
 
 # Stock LCA_2 (0x69) frames from a drive on 2026-11-18, one per byte-1 value seen: the
@@ -45,7 +48,8 @@ LCA_5_FRAMES = [
 ]
 
 # (b1, b2) -> byte[0], observed on the bus.
-# b1 = SIG1 counter (high nibble) | LCA_ENABLED_ECHO (low nibble), b2 = 0x80 | counter.
+# b1 = RACK_COUNTER (high nibble) | LCA_ENABLED_ECHO (low nibble),
+# b2 = PSCM_STATUS 8 (high nibble) | RACK_COUNTER_REPLICA (low nibble).
 # ECHO 0/1/4 are normal driving; ECHO 6 only appears while ESC is intervening and was
 # the case that used to fall through to a 0x00 checksum.
 PSCM_RELATED_CHECKSUM_1 = {
@@ -92,6 +96,51 @@ class TestPscmRelatedChecksums(unittest.TestCase):
     for b2, expected in PSCM_RELATED_CHECKSUM_2.items():
       with self.subTest(b2=hex(b2)):
         assert checksum_2_pscm_related_message(b2) == expected
+
+
+def _pscm_related(b1, b2):
+  """A PSCM_RELATED frame with both checksums computed for the given bytes 1 and 2."""
+  return bytes([checksum_1_pscm_related_message(b1, b2), b1, b2, checksum_2_pscm_related_message(b2), 0, 0, 0, 0])
+
+
+def _decode(frame):
+  """(signals, raw frame) for a PSCM_RELATED frame, decoded the way carstate gets it."""
+  parser = CANParser("volvo_mid_1", [("PSCM_RELATED", 0)], 0)
+  parser.update([(0, [(0x17, frame, 0)])])
+  return dict(parser.vl["PSCM_RELATED"]), parser.vl_raw["PSCM_RELATED"]
+
+
+class TestPscmStatusSupported(unittest.TestCase):
+  def test_signal_names_match_the_nibbles(self):
+    msg, _ = _decode(_pscm_related(0x51, 0x85))
+    assert (msg["RACK_COUNTER"], msg["LCA_ENABLED_ECHO"]) == (5, 1)  # byte 1 high / low nibble
+    assert (msg["PSCM_STATUS"], msg["RACK_COUNTER_REPLICA"]) == (8, 5)  # byte 2 high / low nibble
+
+  def test_frames_seen_on_the_car_are_supported(self):
+    for (b1, b2), cs1 in PSCM_RELATED_CHECKSUM_1.items():
+      frame = bytes([cs1, b1, b2, PSCM_RELATED_CHECKSUM_2[b2], 0, 0, 0, 0])
+      with self.subTest(frame=frame.hex()):
+        assert pscm_status_supported(*_decode(frame))
+
+  def test_each_condition_alone_makes_it_unsupported(self):
+    base = _pscm_related(0x51, 0x85)  # RACK_COUNTER 5, LCA_ENABLED_ECHO 1, PSCM_STATUS 8, replica 5
+    assert pscm_status_supported(*_decode(base))
+    cases = {
+      "bad checksum 1": bytes([base[0] ^ 1]) + base[1:],
+      "bad checksum 2": base[:3] + bytes([base[3] ^ 1]) + base[4:],
+      "PSCM_STATUS 9": _pscm_related(0x51, 0x95),
+      "LCA_ENABLED_ECHO top bit set": _pscm_related(0x59, 0x85),
+      "RACK_COUNTER != replica": _pscm_related(0x51, 0x86),
+      "replica 15": _pscm_related(0xF1, 0x8F),
+      "never received (zeros)": bytes(8),
+    }
+    for name, frame in cases.items():
+      with self.subTest(name):
+        assert not pscm_status_supported(*_decode(frame))
+
+  def test_short_frame_is_unsupported(self):
+    msg, raw = _decode(_pscm_related(0x51, 0x85))
+    assert not pscm_status_supported(msg, raw[:7])
 
 
 class TestLca2Checksum(unittest.TestCase):

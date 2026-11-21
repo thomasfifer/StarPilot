@@ -3,6 +3,7 @@ from opendbc.car import Bus, ButtonType, create_button_events, structs
 from opendbc.can.parser import CANParser
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.interfaces import CarStateBase
+from opendbc.car.volvo.helpers import pscm_status_supported
 from opendbc.car.volvo.values import CAR, DBC, VolvoC1PlatformConfig
 from opendbc.safety import ALTERNATIVE_EXPERIENCE
 
@@ -54,7 +55,7 @@ class CarState(CarStateBase):
     cp_main = can_parsers[Bus.main]
     cp_pt = can_parsers[Bus.pt]
     cp_party = can_parsers[Bus.party]
-    
+
     ret = structs.CarState()
     ret.vEgoRaw = cp_main.vl["SPEED"]["SPEED"] * SPEED_TO_MS
     ret.vEgo, ret.aEgo = self.update_speed_kf(ret.vEgoRaw)
@@ -66,6 +67,8 @@ class CarState(CarStateBase):
     ret.steeringAngleDeg = cp_party.vl['PSCM']['PSCM_ANGLE_SENSOR']
     ret.steeringTorque = -cp_party.vl['DRIVER_INPUT']['STEERING_DRIVER_INPUT']  # Car right turn is negative, openpilot right turn is positive
     ret.steeringPressed = abs(ret.steeringTorque) > STEERING_PRESSED_THRESHOLD
+    self.msg_pscm_related = cp_party.vl['PSCM_RELATED']
+    ret.steerFaultTemporary = not pscm_status_supported(self.msg_pscm_related, cp_party.vl_raw['PSCM_RELATED'])
     self.eps_active = True  # Assume EPS is active for now
 
     cruise_raw = cp_pt.vl["BUS1_CRUISE_CONTROL"]["CRUISE_CONTROL_SPA_ENABLED"] == 1 # inverted (0 = cruise on, 1 = cruise off)
@@ -119,7 +122,6 @@ class CarState(CarStateBase):
     self.msg_lca_3 = cp_main.vl['LCA_3']
     self.msg_lca_4 = cp_main.vl['LCA_4']
     self.msg_lca_5 = cp_main.vl['LCA_5']
-    self.msg_pscm_related = cp_party.vl['PSCM_RELATED']
 
     self.pilot_assist_engaged = cp_main.vl['LCA_2']['PILOT_ASSIST_ENGAGED'] == 1
 

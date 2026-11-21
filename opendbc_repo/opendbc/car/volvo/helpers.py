@@ -82,6 +82,16 @@ def checksum_2_pscm_related_message(b2):
   return lut.get(b2, 0)
 
 
+def pscm_status_supported(msg: dict, dat: bytes) -> bool:
+  """Whether a PSCM_RELATED (0x17) frame reports a status the PSCM accepts LCA steering in"""
+  return (len(dat) == 8 and
+          msg['PSCM_STATUS'] == 8 and
+          msg['RACK_COUNTER'] == msg['RACK_COUNTER_REPLICA'] < 15 and
+          not int(msg['LCA_ENABLED_ECHO']) & 0x8 and
+          msg['CHECKSUM_1'] == checksum_1_pscm_related_message(dat[1], dat[2]) and
+          msg['CHECKSUM_2'] == checksum_2_pscm_related_message(dat[2]))
+
+
 def checksum_lca_5_message(byte0: int, byte1: int, byte3: int, byte4: int, byte5: int) -> int:
   # Helper function to extract a bit (LSB = bit 0)
   def bit(byte_val, pos):
