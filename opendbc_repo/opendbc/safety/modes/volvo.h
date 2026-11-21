@@ -2,13 +2,11 @@
 
 #include "opendbc/safety/declarations.h"
 
-// safetyParam: 0 = CMA (XC40 Recharge), 1 = SPA (S60 Recharge, Polestar 2),
-// 2 = C1 (V40)
+// safetyParam: 0 = SPA (XC40 Recharge, S60 Recharge, Polestar 2), 2 = C1 (V40)
 // Polestar 2 is technically CMA, but appears to use SPA DBC for CAN 1 bus
-#define VOLVO_FLAG_SPA 1U
 #define VOLVO_FLAG_C1 2U
 
-// Volvo CAN message addresses shared between CMA and SPA
+// Volvo SPA CAN message addresses
 #define VOLVO_LCA_STEER           0x58U    // TX from VCU1 to PSCM, LCA steering command (0x58)
 #define VOLVO_LCA_2               0x69U   // RX from BCM, brake pedal, cruise state
 #define VOLVO_SAS                 0x55U    // RX from SAS, steering angle sensor
@@ -19,12 +17,11 @@
 #define VOLVO_LCA_5               0x67U   // TX LCA_5 message (formerly SPEED_1, contains wheel speeds and LCA signals)
 #define VOLVO_SPEED               0x60U   // RX/TX SPEED message
 #define VOLVO_SPEED_2             0x68U   // RX
-#define VOLVO_0x1a                0x1aU   // RX
 #define VOLVO_EGSM                0x45U   // RX from EGSM
 #define VOLVO_PSCM_RELATED        0x17U   // RX from PSCM, related messages
 #define VOLVO_LCA_4               0x90U   // TX LCA_4 message (PA status spoofing)
-#define VOLVO_LCA_6               0x97U   // TX LCA_6 message
-#define VOLVO_LCA_7               0x92U   // TX LCA_7 message
+#define VOLVO_LCA_6               0x97U   // RX, forwarded unmodified
+#define VOLVO_LCA_7               0x92U   // RX, forwarded unmodified
 
 // C1-specific addresses (V40). The V40 powertrain bus is bus 0 and its
 // forward-camera bus is bus 2; bus 1 is unused by this port.
@@ -35,12 +32,7 @@
 #define VOLVO_C1_PEDAL_AND_BRAKE   0x55U
 #define VOLVO_C1_SPEED             0x150U
 
-// CMA-specific PT bus addresses
-#define VOLVO_CMA_BUS1_SPEED          0x70U   // RX vehicle speed
-#define VOLVO_CMA_ECM_1               0x250U  // RX accelerator pedal position
-#define VOLVO_CMA_BUS1_CRUISE_CONTROL 0x340U  // RX cruise control state
-
-// SPA-specific PT bus addresses
+// SPA PT bus addresses
 #define VOLVO_SPA_BUS1_SPEED          0x75U   // RX vehicle speed
 #define VOLVO_SPA_ECM_1               0x25U   // RX accelerator pedal position
 #define VOLVO_SPA_BUS1_CRUISE_CONTROL 0x349U  // RX cruise control state
@@ -66,9 +58,6 @@
 #define VOLVO_PT_BUS      1U  // Bus.pt - VCU1 ECM side (where ECM is)
 #define VOLVO_PARTY_BUS   2U  // Bus.party - VCU PSCM/BCM2 side (BCM2, SAS, EGSM, PSCM, where LCA is sent to)
 
-// Runtime addresses set by volvo_init based on safetyParam
-static uint16_t volvo_ecm_1_addr;
-static uint16_t volvo_bus1_cruise_control_addr;
 static bool volvo_c1;
 
 // Always On Lateral off->on->off tap detection
@@ -78,25 +67,43 @@ static bool volvo_aol_seen_rising = false;
 static bool volvo_aol_cruise_prev = false;
 static uint32_t volvo_aol_rising_ts = 0U;
 
-#define VOLVO_STOCK_LCA5_FRAMES 4U
-#define VOLVO_STOCK_LCA5_MAX_AGE_US 100000U
-static uint8_t volvo_stock_lca5_data[VOLVO_STOCK_LCA5_FRAMES][8];
-static uint32_t volvo_stock_lca5_ts[VOLVO_STOCK_LCA5_FRAMES];
-static bool volvo_stock_lca5_valid[VOLVO_STOCK_LCA5_FRAMES];
-static uint8_t volvo_stock_lca5_index;
+// Messages openpilot replaces while actively steering. While openpilot is sending
+// one, the stock version arriving on stock_bus must not also be forwarded. Panda
+// tracks when each was last allowed through volvo_tx_hook and only blocks the stock
+// frame while that is recent, so the two sides can't disagree: if openpilot stops
+// sending (disengaged, lateral paused, or the process stalls) the stock frames flow
+// again within timeout_us instead of the address going silent.
+//
+// timeout_us is ~2.5x the longest gap between openpilot sends for that address:
+// long enough to ride through normal scheduling jitter, short enough that a stall
+// only drops a couple of frames before stock traffic takes over.
+typedef struct {
+  uint32_t addr;
+  int stock_bus;
+  uint32_t timeout_us;
+} VolvoReplacedMsg;
 
-static bool volvo_lca5_stock_relay(const CANPacket_t *msg) {
-  const uint32_t now = microsecond_timer_get();
-  bool matches_stock = false;
-  for (uint8_t i = 0U; i < VOLVO_STOCK_LCA5_FRAMES; i++) {
-    bool matches = volvo_stock_lca5_valid[i] &&
-                   (safety_get_ts_elapsed(now, volvo_stock_lca5_ts[i]) <= VOLVO_STOCK_LCA5_MAX_AGE_US);
-    for (uint8_t byte = 0U; byte < 8U; byte++) {
-      matches &= msg->data[byte] == volvo_stock_lca5_data[i][byte];
+#define VOLVO_REPLACED_MSG_CNT 7U
+static const VolvoReplacedMsg VOLVO_REPLACED_MSGS[VOLVO_REPLACED_MSG_CNT] = {
+  {VOLVO_LCA_STEER,    (int)VOLVO_MAIN_BUS,  25000U},  // 100 Hz
+  {VOLVO_PSCM,         (int)VOLVO_PARTY_BUS, 25000U},  // 100 Hz
+  {VOLVO_PSCM_RELATED, (int)VOLVO_PARTY_BUS, 25000U},  // 100 Hz
+  {VOLVO_LCA_3,        (int)VOLVO_MAIN_BUS,  50000U},  // 2 of every 3 frames, max gap 20 ms
+  {VOLVO_LCA_2,        (int)VOLVO_MAIN_BUS,  50000U},  // 50 Hz
+  {VOLVO_LCA_5,        (int)VOLVO_MAIN_BUS,  50000U},  // 50 Hz
+  {VOLVO_LCA_4,        (int)VOLVO_MAIN_BUS,  100000U}, // ~29 Hz, max gap 40 ms
+};
+static uint32_t volvo_replaced_tx_ts[VOLVO_REPLACED_MSG_CNT];
+static bool volvo_replaced_tx_seen[VOLVO_REPLACED_MSG_CNT];
+
+static int volvo_replaced_msg_index(uint32_t addr) {
+  int index = -1;
+  for (uint8_t i = 0U; i < VOLVO_REPLACED_MSG_CNT; i++) {
+    if (VOLVO_REPLACED_MSGS[i].addr == addr) {
+      index = (int)i;
     }
-    matches_stock |= matches;
   }
-  return matches_stock;
+  return index;
 }
 
 static int volvo_be_15(const CANPacket_t *msg, uint8_t byte) {
@@ -187,15 +194,6 @@ static void volvo_rx_hook(const CANPacket_t *msg) {
 
   // Main bus (bus 0) messages
   if (msg->bus == VOLVO_MAIN_BUS) {
-    if (msg->addr == VOLVO_LCA_5) {
-      for (uint8_t byte = 0U; byte < 8U; byte++) {
-        volvo_stock_lca5_data[volvo_stock_lca5_index][byte] = msg->data[byte];
-      }
-      volvo_stock_lca5_ts[volvo_stock_lca5_index] = microsecond_timer_get();
-      volvo_stock_lca5_valid[volvo_stock_lca5_index] = true;
-      volvo_stock_lca5_index = (volvo_stock_lca5_index + 1U) % VOLVO_STOCK_LCA5_FRAMES;
-    }
-
     // Update brake pedal and cruise state from BCM2
     if (msg->addr == VOLVO_LCA_2) {
       // DBC: SG_ BRAKE_PEDAL_PRESSED_A : 47|1@0+ (-1,1) - inverted in DBC, so we invert raw bit
@@ -220,27 +218,15 @@ static void volvo_rx_hook(const CANPacket_t *msg) {
 
   // PT bus (bus 1) messages
   if (msg->bus == VOLVO_PT_BUS) {
-    if (msg->addr == volvo_ecm_1_addr) {
-      if (volvo_ecm_1_addr == VOLVO_CMA_ECM_1) {
-        // CMA: SG_ ACCELERATOR_PEDAL_POS : 31|8@0+ (1,0) [0|255]
-        uint8_t gas_pedal_position = msg->data[3];
-        gas_pressed = gas_pedal_position > 21U; // 20 baseline + 1 tolerance
-      } else {
-        // SPA: SG_ ACCELERATOR_PEDAL_POS : 6|15@0+ (0.00390625,0) [0|32767] "%"
-        uint16_t gas_raw = ((msg->data[0] & 0x7FU) << 8) | msg->data[1];
-        gas_pressed = (gas_raw * 0.00390625) > 1.0; // > 1%
-      }
+    if (msg->addr == VOLVO_SPA_ECM_1) {
+      // SG_ ACCELERATOR_PEDAL_POS : 6|15@0+ (0.00390625,0) [0|32767] "%"
+      uint16_t gas_raw = ((msg->data[0] & 0x7FU) << 8) | msg->data[1];
+      gas_pressed = (gas_raw * 0.00390625) > 1.0; // > 1%
     }
 
-    if (msg->addr == volvo_bus1_cruise_control_addr) {
-      bool cruise_enabled;
-      if (volvo_bus1_cruise_control_addr == VOLVO_CMA_BUS1_CRUISE_CONTROL) {
-        // CMA: SG_ CRUISE_CONTROL_ENABLED : 56|1@0+ and CRUISE_CONTROL_ENABLED_IDLE_TRAFFIC : 57|1@0+
-        cruise_enabled = ((msg->data[7] & 1U) || (msg->data[7] & 2U));
-      } else {
-        // SPA: SG_ CRUISE_CONTROL_SPA_ENABLED : 1|1@0+ (-1,1) — byte 0 bit 1, active low
-        cruise_enabled = !((msg->data[0] >> 1) & 1U);
-      }
+    if (msg->addr == VOLVO_SPA_BUS1_CRUISE_CONTROL) {
+      // SG_ CRUISE_CONTROL_SPA_ENABLED : 1|1@0+ (-1,1) — byte 0 bit 1, active low
+      bool cruise_enabled = !((msg->data[0] >> 1) & 1U);
 
       if ((alternative_experience & ALT_EXP_ALWAYS_ON_LATERAL) != 0U) {
         bool rising = cruise_enabled && !volvo_aol_cruise_prev;
@@ -327,13 +313,9 @@ static bool volvo_tx_hook(const CANPacket_t *msg) {
   // LCA frame also contains an angle-shaped field, but the imported controller
   // deliberately leaves that field at the observed vehicle value.
   if (msg->addr == VOLVO_LCA_5) {
-    if (!controls_allowed && volvo_lca5_stock_relay(msg)) {
-      desired_angle_last = SAFETY_CLAMP(angle_meas.values[0], -VOLVO_MAX_ANGLE_CAN, VOLVO_MAX_ANGLE_CAN);
-    } else {
-      const int desired_angle = volvo_lca_5_angle(msg);
-      tx &= SAFETY_ABS(desired_angle) <= VOLVO_MAX_ANGLE_CAN;
-      tx &= !steer_angle_cmd_checks(desired_angle, aol_allowed || controls_allowed, VOLVO_ANGLE_STEERING_LIMITS);
-    }
+    const int desired_angle = volvo_lca_5_angle(msg);
+    tx &= SAFETY_ABS(desired_angle) <= VOLVO_MAX_ANGLE_CAN;
+    tx &= !steer_angle_cmd_checks(desired_angle, aol_allowed || controls_allowed, VOLVO_ANGLE_STEERING_LIMITS);
   }
 
   // Keep the two torque-authority arms and the companion LCA angle bounded even
@@ -419,15 +401,41 @@ static bool volvo_tx_hook(const CANPacket_t *msg) {
     // GCOV_EXCL_STOP
   }
 
+  // Only a replacement that is actually allowed onto the bus takes over from the
+  // stock frame; a rejected one leaves the stock frame forwarding.
+  if (tx) {
+    const int index = volvo_replaced_msg_index(msg->addr);
+    if (index >= 0) {
+      volvo_replaced_tx_ts[index] = microsecond_timer_get();
+      volvo_replaced_tx_seen[index] = true;
+    }
+  }
+
   return tx;
 }
 
+// Each replaced address is marked .disable_static_blocking in VOLVO_TX_MSGS so this
+// hook decides forwarding instead of panda blocking it permanently from boot. See
+// VOLVO_REPLACED_MSGS for the timing rationale.
+static bool volvo_fwd_hook(int bus_num, int addr) {
+  bool block_msg = false;
+
+  if (!volvo_c1) {
+    const int index = volvo_replaced_msg_index((uint32_t)addr);
+    if ((index >= 0) && (VOLVO_REPLACED_MSGS[index].stock_bus == bus_num) && volvo_replaced_tx_seen[index]) {
+      const uint32_t elapsed = safety_get_ts_elapsed(microsecond_timer_get(), volvo_replaced_tx_ts[index]);
+      block_msg = elapsed <= VOLVO_REPLACED_MSGS[index].timeout_us;
+    }
+  }
+
+  return block_msg;
+}
+
 static safety_config volvo_init(uint16_t param) {
-  bool spa = GET_FLAG(param, VOLVO_FLAG_SPA);
   volvo_c1 = GET_FLAG(param, VOLVO_FLAG_C1);
-  volvo_stock_lca5_index = 0U;
-  for (uint8_t i = 0U; i < VOLVO_STOCK_LCA5_FRAMES; i++) {
-    volvo_stock_lca5_valid[i] = false;
+  for (uint8_t i = 0U; i < VOLVO_REPLACED_MSG_CNT; i++) {
+    volvo_replaced_tx_seen[i] = false;
+    volvo_replaced_tx_ts[i] = 0U;
   }
   volvo_aol_armed = false;
   volvo_aol_seen_rising = false;
@@ -448,81 +456,48 @@ static safety_config volvo_init(uint16_t param) {
     return BUILD_SAFETY_CFG(volvo_c1_rx_checks, VOLVO_C1_TX_MSGS);
   }
 
-  // Set PT bus addresses based on platform
-  volvo_ecm_1_addr = spa ? VOLVO_SPA_ECM_1 : VOLVO_CMA_ECM_1;
-  volvo_bus1_cruise_control_addr = spa ? VOLVO_SPA_BUS1_CRUISE_CONTROL : VOLVO_CMA_BUS1_CRUISE_CONTROL;
-
   // Define the TX messages needed to replace the stock LCA path. Payload
   // limits for steering and the PSCM relay are enforced in volvo_tx_hook.
+  // disable_static_blocking defers the forwarding decision to volvo_fwd_hook, which
+  // only blocks the stock version of each address while openpilot is recently
+  // sending its replacement, instead of permanently from boot. LCA_6/LCA_7 are not
+  // modified, so they're simply forwarded and not TX'd at all.
   static const CanMsg VOLVO_TX_MSGS[] = {
-    {VOLVO_LCA_STEER, VOLVO_PARTY_BUS, 8, .check_relay = true},  // LCA steering command to party bus
-    {VOLVO_PSCM, VOLVO_MAIN_BUS, 8, .check_relay = true},  // PSCM message sent to main bus (relay from party bus)
-    {VOLVO_LCA_3, VOLVO_PARTY_BUS, 8, .check_relay = true},  // LCA_3 message sent to party bus
-    {VOLVO_LCA_2, VOLVO_PARTY_BUS, 8, .check_relay = true},  // LCA_2 message sent to party bus (spoof PILOT_ASSIST_ENGAGED for PSCM)
-    {VOLVO_LCA_4, VOLVO_PARTY_BUS, 8, .check_relay = true},  // LCA_4 message sent to party bus (spoof LCA_ENABLE for PA state)
-    {VOLVO_LCA_5, VOLVO_PARTY_BUS, 8, .check_relay = true},  // LCA_5 message sent to party bus (wheel speeds + LCA signals)
-    {VOLVO_LCA_6, VOLVO_PARTY_BUS, 8, .check_relay = true},  // LCA_6 message sent to party bus
-    {VOLVO_LCA_7, VOLVO_PARTY_BUS, 8, .check_relay = true},  // LCA_7 message sent to party bus
-    //{VOLVO_SPEED, VOLVO_PARTY_BUS, 8, .check_relay = true},  // SPEED message sent to main bus
-    //{VOLVO_SPEED_2, VOLVO_PARTY_BUS, 8, .check_relay = true},  // SPEED_2 message sent to main bus
-    //{VOLVO_0x1a, VOLVO_PARTY_BUS, 8, .check_relay = true},  // 0x1a message sent to main bus
-    //{VOLVO_GEAR_POSITION, VOLVO_PARTY_BUS, 8, .check_relay = true},  // GEAR_POSITION message sent from main to party bus
-    //{VOLVO_EGSM, VOLVO_MAIN_BUS, 8, .check_relay = true},  // EGSM message sent from party to main bus
-    {VOLVO_PSCM_RELATED, VOLVO_MAIN_BUS, 8, .check_relay = true},  // PSCM_RELATED message sent to party bus
+    {VOLVO_LCA_STEER, VOLVO_PARTY_BUS, 8, .check_relay = true, .disable_static_blocking = true},  // LCA steering command to party bus
+    {VOLVO_PSCM, VOLVO_MAIN_BUS, 8, .check_relay = true, .disable_static_blocking = true},  // PSCM message sent to main bus (relay from party bus)
+    {VOLVO_LCA_3, VOLVO_PARTY_BUS, 8, .check_relay = true, .disable_static_blocking = true},  // LCA_3 message sent to party bus
+    {VOLVO_LCA_2, VOLVO_PARTY_BUS, 8, .check_relay = true, .disable_static_blocking = true},  // LCA_2 message sent to party bus (spoof PILOT_ASSIST_ENGAGED for PSCM)
+    {VOLVO_LCA_4, VOLVO_PARTY_BUS, 8, .check_relay = true, .disable_static_blocking = true},  // LCA_4 message sent to party bus (spoof LCA_ENABLE for PA state)
+    {VOLVO_LCA_5, VOLVO_PARTY_BUS, 8, .check_relay = true, .disable_static_blocking = true},  // LCA_5 message sent to party bus (wheel speeds + LCA signals)
+    {VOLVO_PSCM_RELATED, VOLVO_MAIN_BUS, 8, .check_relay = true, .disable_static_blocking = true},  // PSCM_RELATED message sent to party bus
   };
 
-  // Define RX checks - PT bus addresses depend on CMA vs SPA
-  safety_config ret;
-  if (!spa) {
-    static RxCheck volvo_rx_checks_cma[] = {
-      {.msg = {{VOLVO_GEAR_POSITION, VOLVO_MAIN_BUS, 8, 40U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-      {.msg = {{VOLVO_LCA_2, VOLVO_MAIN_BUS, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-      {.msg = {{VOLVO_LCA_4, VOLVO_MAIN_BUS, 8, 29U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-      {.msg = {{VOLVO_LCA_6, VOLVO_MAIN_BUS, 8, 25U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-      {.msg = {{VOLVO_LCA_7, VOLVO_MAIN_BUS, 8, 29U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-      {.msg = {{VOLVO_SAS, VOLVO_PARTY_BUS, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-      {.msg = {{VOLVO_PSCM, VOLVO_PARTY_BUS, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-      {.msg = {{VOLVO_DRIVER_INPUT, VOLVO_PARTY_BUS, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-      {.msg = {{VOLVO_CMA_ECM_1, VOLVO_PT_BUS, 8, 17U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-      {.msg = {{VOLVO_LCA_STEER, VOLVO_MAIN_BUS, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-      {.msg = {{VOLVO_CMA_BUS1_CRUISE_CONTROL, VOLVO_PT_BUS, 8, 10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-      {.msg = {{VOLVO_LCA_3, VOLVO_MAIN_BUS, 8, 67U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-      {.msg = {{VOLVO_LCA_5, VOLVO_MAIN_BUS, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-      {.msg = {{VOLVO_SPEED, VOLVO_MAIN_BUS, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-      {.msg = {{VOLVO_SPEED_2, VOLVO_MAIN_BUS, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-      {.msg = {{VOLVO_EGSM, VOLVO_PARTY_BUS, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-      {.msg = {{VOLVO_PSCM_RELATED, VOLVO_PARTY_BUS, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-    };
-    ret = BUILD_SAFETY_CFG(volvo_rx_checks_cma, VOLVO_TX_MSGS);
-  } else {
-    static RxCheck volvo_rx_checks_spa[] = {
-      {.msg = {{VOLVO_GEAR_POSITION, VOLVO_MAIN_BUS, 8, 40U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-      {.msg = {{VOLVO_LCA_2, VOLVO_MAIN_BUS, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-      {.msg = {{VOLVO_LCA_4, VOLVO_MAIN_BUS, 8, 29U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-      {.msg = {{VOLVO_LCA_6, VOLVO_MAIN_BUS, 8, 25U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-      {.msg = {{VOLVO_LCA_7, VOLVO_MAIN_BUS, 8, 29U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-      {.msg = {{VOLVO_SAS, VOLVO_PARTY_BUS, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-      {.msg = {{VOLVO_PSCM, VOLVO_PARTY_BUS, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-      {.msg = {{VOLVO_DRIVER_INPUT, VOLVO_PARTY_BUS, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-      {.msg = {{VOLVO_SPA_ECM_1, VOLVO_PT_BUS, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-      {.msg = {{VOLVO_LCA_STEER, VOLVO_MAIN_BUS, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-      // true rate is 5Hz, but safety_tick invalidates checks declared <10Hz; lagging floor is 1s either way
-      {.msg = {{VOLVO_SPA_BUS1_CRUISE_CONTROL, VOLVO_PT_BUS, 8, 10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-      {.msg = {{VOLVO_LCA_3, VOLVO_MAIN_BUS, 8, 67U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-      {.msg = {{VOLVO_LCA_5, VOLVO_MAIN_BUS, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-      {.msg = {{VOLVO_SPEED, VOLVO_MAIN_BUS, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-      {.msg = {{VOLVO_SPEED_2, VOLVO_MAIN_BUS, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-      {.msg = {{VOLVO_EGSM, VOLVO_PARTY_BUS, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-      {.msg = {{VOLVO_PSCM_RELATED, VOLVO_PARTY_BUS, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
-    };
-    ret = BUILD_SAFETY_CFG(volvo_rx_checks_spa, VOLVO_TX_MSGS);
-  }
-  return ret;
+  static RxCheck volvo_rx_checks_spa[] = {
+    {.msg = {{VOLVO_GEAR_POSITION, VOLVO_MAIN_BUS, 8, 40U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{VOLVO_LCA_2, VOLVO_MAIN_BUS, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{VOLVO_LCA_4, VOLVO_MAIN_BUS, 8, 29U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{VOLVO_LCA_6, VOLVO_MAIN_BUS, 8, 25U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{VOLVO_LCA_7, VOLVO_MAIN_BUS, 8, 29U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{VOLVO_SAS, VOLVO_PARTY_BUS, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{VOLVO_PSCM, VOLVO_PARTY_BUS, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{VOLVO_DRIVER_INPUT, VOLVO_PARTY_BUS, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{VOLVO_SPA_ECM_1, VOLVO_PT_BUS, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{VOLVO_LCA_STEER, VOLVO_MAIN_BUS, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    // true rate is 5Hz, but safety_tick invalidates checks declared <10Hz; lagging floor is 1s either way
+    {.msg = {{VOLVO_SPA_BUS1_CRUISE_CONTROL, VOLVO_PT_BUS, 8, 10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{VOLVO_LCA_3, VOLVO_MAIN_BUS, 8, 67U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{VOLVO_LCA_5, VOLVO_MAIN_BUS, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{VOLVO_SPEED, VOLVO_MAIN_BUS, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{VOLVO_SPEED_2, VOLVO_MAIN_BUS, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{VOLVO_EGSM, VOLVO_PARTY_BUS, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{VOLVO_PSCM_RELATED, VOLVO_PARTY_BUS, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+  };
+  return BUILD_SAFETY_CFG(volvo_rx_checks_spa, VOLVO_TX_MSGS);
 }
 
 const safety_hooks volvo_hooks = {
   .init = volvo_init,
   .rx = volvo_rx_hook,
   .tx = volvo_tx_hook,
-  // No custom fwd hook - stock LCA always blocked by .check_relay = true
+  .fwd = volvo_fwd_hook,
 };

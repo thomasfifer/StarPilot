@@ -1,20 +1,17 @@
 #!/usr/bin/env python3
 """
-Safety tests for Volvo C1/CMA/SPA.
+Safety tests for Volvo SPA and C1.
 
 The safety mode lives at ``opendbc/safety/modes/volvo.h`` and is parameterized
 by ``safetyParam``:
 
-  - ``safetyParam == 0``       → CMA platform (Volvo XC40 Recharge)
-  - ``safetyParam == VOLVO_FLAG_SPA`` → SPA platform (Volvo S60 Recharge,
-    Polestar 2)
-  - ``safetyParam == VOLVO_FLAG_C1``  → C1 platform (Volvo V40)
+  - ``safetyParam == 0``             → SPA platform (Volvo XC40 Recharge,
+    S60 Recharge, Polestar 2)
+  - ``safetyParam == VOLVO_FLAG_C1`` → C1 platform (Volvo V40)
 
-CMA and SPA share LCA/PSCM/etc. addresses on the main and party buses but use
-different PT-bus addresses and signal scales. C1 uses the V40's legacy CAN
-layout and its own safety allowlist. The tests exercise all three through the
-generic ``CarSafetyTest`` harness so divergence between ``carstate.py`` and
-``volvo.h`` is caught before running in a car.
+C1 uses the V40's legacy CAN layout and its own safety allowlist. Both are
+exercised through the generic ``CarSafetyTest`` harness so divergence between
+``carstate.py`` and ``volvo.h`` is caught before running in a car.
 
 Companion to: ``opendbc/car/volvo/carstate.py`` (must agree on thresholds).
 """
@@ -36,7 +33,6 @@ VOLVO_AOL_ENTRY_WINDOW_US = 500000
 
 
 # Must match the flags in opendbc/safety/modes/volvo.h
-VOLVO_FLAG_SPA = VolvoSafetyFlags.SPA.value
 VOLVO_FLAG_C1 = VolvoSafetyFlags.C1.value
 
 # Must match VOLVO_SPEED_TO_MS in volvo.h and SPEED_TO_MS in carstate.py
@@ -63,16 +59,33 @@ VOLVO_DRIVER_INPUT  = 0x15
 
 # Addresses panda TX'd with .check_relay = true, grouped by bus
 _TX_PARTY_BUS_ADDRS = (
-  VOLVO_LCA_STEER, VOLVO_LCA_2, VOLVO_LCA_3, VOLVO_LCA_4,
-  VOLVO_LCA_5, VOLVO_LCA_6, VOLVO_LCA_7,
+  VOLVO_LCA_STEER, VOLVO_LCA_2, VOLVO_LCA_3, VOLVO_LCA_4, VOLVO_LCA_5,
 )
 _TX_MAIN_BUS_ADDRS = (VOLVO_PSCM, VOLVO_PSCM_RELATED)
 
+# Every TX'd address replaces a stock frame arriving on the opposite bus.
+FWD_BUS = {VOLVO_MAIN_BUS: VOLVO_PARTY_BUS, VOLVO_PARTY_BUS: VOLVO_MAIN_BUS}
+_REPLACED_STOCK_BUS = {
+  **{a: VOLVO_MAIN_BUS for a in _TX_PARTY_BUS_ADDRS},
+  **{a: VOLVO_PARTY_BUS for a in _TX_MAIN_BUS_ADDRS},
+}
+# Must match VOLVO_REPLACED_MSGS timeout_us in volvo.h
+_REPLACED_TIMEOUT_US = {
+  VOLVO_LCA_STEER: 25000, VOLVO_PSCM: 25000, VOLVO_PSCM_RELATED: 25000,
+  VOLVO_LCA_3: 50000, VOLVO_LCA_2: 50000, VOLVO_LCA_5: 50000,
+  VOLVO_LCA_4: 100000,
+}
 
-class TestVolvoSafetyBase(common.CarSafetyTest):
-  """Shared RX/TX/relay tests for both CMA and SPA.
 
-  Subclasses pin down the PT-bus DBC and per-platform gas/cruise encoding.
+class TestVolvoSPA(common.CarSafetyTest):
+  """
+  Volvo SPA: XC40 Recharge, S60 Recharge, Polestar 2.
+
+  ECM_1.ACCELERATOR_PEDAL_POS is DBC-scaled to percent (factor 0.00390625,
+  range 0-100%). Idle is ~0; panda fires gas_pressed above 1.0%.
+  carstate.py MUST use the same percent-based threshold — see
+  opendbc/car/volvo/carstate.py. A mismatch here manifests in test_models.py
+  as persistent ``panda safety doesn't agree with openpilot: {'gasPressed': N}``.
   """
 
   TX_MSGS = (
@@ -83,28 +96,16 @@ class TestVolvoSafetyBase(common.CarSafetyTest):
     VOLVO_PARTY_BUS: _TX_PARTY_BUS_ADDRS,
     VOLVO_MAIN_BUS: _TX_MAIN_BUS_ADDRS,
   }
-  # volvo.h installs no custom fwd hook, so the panda uses the default main<->party
-  # forwarding (bus 0 <-> bus 2). For each TX addr with .check_relay=true, the panda
-  # automatically refuses to forward from the bus where stock traffic lives TO the
-  # bus where openpilot is TX'ing — that's what keeps the stock ECU from fighting us.
-  FWD_BLACKLISTED_ADDRS = {
-    VOLVO_MAIN_BUS: list(_TX_PARTY_BUS_ADDRS),   # stock on 0 must not forward to 2
-    VOLVO_PARTY_BUS: list(_TX_MAIN_BUS_ADDRS),   # stock on 2 must not forward to 0
-  }
+  # volvo.h installs volvo_fwd_hook, which only blocks the stock version of a TX
+  # addr while openpilot has recently sent its replacement. There's no static
+  # (always-blocked) blacklist for SPA, so test_fwd_hook (nothing sent yet) sees
+  # every address forward normally. See the test_fwd_hook_* tests below.
   STANDSTILL_THRESHOLD = 0.1  # m/s, matches volvo.h
+  GAS_PRESSED_THRESHOLD = 1.0  # percent
 
-  # Subclasses set these
-  SAFETY_PARAM: int = 0
-  PT_DBC: str = ""
-
+  SAFETY_PARAM = 0
+  PT_DBC = "volvo_front_1_spa"
   MID_DBC = "volvo_mid_1"
-
-  @classmethod
-  def setUpClass(cls):
-    if cls.__name__ == "TestVolvoSafetyBase":
-      cls.safety = None
-      raise unittest.SkipTest
-    super().setUpClass()
 
   def setUp(self):
     self.pt_packer = CANPackerSafety(self.PT_DBC)
@@ -116,12 +117,18 @@ class TestVolvoSafetyBase(common.CarSafetyTest):
     self.safety.set_safety_hooks(SAFETY_VOLVO, self.SAFETY_PARAM)
     self.safety.init_tests()
 
-  def test_tx_hook_on_wrong_safety_mode(self):
-    # CMA and SPA intentionally share the party-bus TX allowlist. safetyParam
-    # selects the PT-bus RX encodings, not a different set of steering frames.
-    self.skipTest("CMA and SPA intentionally share Volvo TX IDs")
-
   # ---- Abstract methods from CarSafetyTest ----
+
+  def _user_gas_msg(self, gas):
+    values = {"ACCELERATOR_PEDAL_POS": gas}
+    return self.pt_packer.make_can_msg_safety("ECM_1", VOLVO_PT_BUS, values)
+
+  def _pcm_status_msg(self, enable):
+    # SPA cruise signal has DBC factor -1 offset 1, so the "enabled" DBC value
+    # is 1 (which encodes as raw bit 0 — panda inverts it).
+    values = {"CRUISE_CONTROL_SPA_ENABLED": 1 if enable else 0}
+    return self.pt_packer.make_can_msg_safety(
+      "BUS1_CRUISE_CONTROL", VOLVO_PT_BUS, values)
 
   def _user_brake_msg(self, brake):
     # volvo.h reads BRAKE_PEDAL_PRESSED_B (bit 46, factor 1, active high)
@@ -191,68 +198,6 @@ class TestVolvoSafetyBase(common.CarSafetyTest):
     self.assertTrue(self._tx(self._angle_cmd_msg(10)))
     self.assertFalse(self._tx(self._angle_cmd_msg(20)))
 
-  STOCK_LCA5 = bytes.fromhex("88c04cef1190ba00")
-
-  def _stock_lca5(self, data=None, bus=VOLVO_PARTY_BUS):
-    return libsafety_py.make_CANPacket(VOLVO_LCA_5, bus, self.STOCK_LCA5 if data is None else data)
-
-  def test_inactive_lca5_stock_relay_requires_unchanged_received_frame(self):
-    self._reset_angle_measurement(10)
-    self.safety.set_timer(100000)
-    self.assertFalse(self._tx(self._stock_lca5()))
-    self._rx(self._stock_lca5(bus=VOLVO_MAIN_BUS))
-    self.assertTrue(self._tx(self._stock_lca5()))
-    self.assertEqual(self.safety.get_desired_angle_last(), round(10 / 0.05596))
-
-    for byte in range(8):
-      altered = bytearray(self.STOCK_LCA5)
-      altered[byte] ^= 1
-      self.assertFalse(self._tx(self._stock_lca5(bytes(altered))), f"altered {byte=}")
-    self.assertFalse(self._tx(self._stock_lca5(bus=VOLVO_MAIN_BUS)))
-    self.assertFalse(self._tx(self._stock_lca5(bus=VOLVO_PT_BUS)))
-
-  def test_inactive_lca5_stock_relay_wrong_rx_bus_and_length(self):
-    self._rx(self._stock_lca5(bus=VOLVO_PT_BUS))
-    self._rx(self._stock_lca5(self.STOCK_LCA5[:7], bus=VOLVO_MAIN_BUS))
-    self.assertFalse(self._tx(self._stock_lca5()))
-
-  def test_inactive_lca5_stock_relay_expires_across_timer_wrap(self):
-    start = 0xFFFF0000
-    self.safety.set_timer(start)
-    self._rx(self._stock_lca5(bus=VOLVO_MAIN_BUS))
-    self.safety.set_timer((start + 100000) & 0xFFFFFFFF)
-    self.assertTrue(self._tx(self._stock_lca5()))
-    self.safety.set_timer((start + 100001) & 0xFFFFFFFF)
-    self.assertFalse(self._tx(self._stock_lca5()))
-
-  def test_inactive_lca5_stock_relay_history_is_bounded(self):
-    frames = []
-    for i in range(5):
-      data = bytearray(self.STOCK_LCA5)
-      data[3] = (data[3] + i) & 0xFF
-      frames.append(bytes(data))
-      self.safety.set_timer(i * 20000)
-      self._rx(self._stock_lca5(frames[-1], bus=VOLVO_MAIN_BUS))
-    self.assertFalse(self._tx(self._stock_lca5(frames[0])))
-    for data in frames[1:]:
-      self.assertTrue(self._tx(self._stock_lca5(data)))
-
-  def test_inactive_lca5_stock_relay_cleared_on_safety_init(self):
-    self._rx(self._stock_lca5(bus=VOLVO_MAIN_BUS))
-    self.assertTrue(self._tx(self._stock_lca5()))
-    self.safety.set_safety_hooks(SAFETY_VOLVO, self.SAFETY_PARAM)
-    self.assertFalse(self._tx(self._stock_lca5()))
-
-  def test_stock_lca5_placeholder_does_not_bypass_active_angle_limits(self):
-    self._reset_angle_measurement(10)
-    self._reset_speed_measurement(50)
-    self._rx(self._stock_lca5(bus=VOLVO_MAIN_BUS))
-    self.assertTrue(self._tx(self._stock_lca5()))
-    self.safety.set_controls_allowed(True)
-    self.assertFalse(self._tx(self._stock_lca5()))
-    self.assertTrue(self._tx(self._angle_cmd_msg(10.4)))
-    self.assertFalse(self._tx(self._angle_cmd_msg(11)))
-
   def test_angle_tx_rate_matches_controller_cadence(self):
     """LCA_5 is 50 Hz, so each frame may contain two 100 Hz controller steps."""
     self._reset_speed_measurement(50)
@@ -267,15 +212,15 @@ class TestVolvoSafetyBase(common.CarSafetyTest):
   def test_lca_authority_is_bounded(self):
     self.safety.set_controls_allowed(True)
     valid = {
-      "LCA_STEER_LOOSELY": 614,
-      "LCA_STEER_LOOSELY_INV": -614,
+      "RIGHT_TORQUE_AUTHORITY": 614,
+      "LEFT_TORQUE_AUTHORITY": -614,
       "LCA_STEER": 0,
     }
     self.assertTrue(self._tx(self.mid_packer.make_can_msg_safety(
       "LCA", VOLVO_PARTY_BUS, valid)))
 
-    for key, value in (("LCA_STEER_LOOSELY", 615),
-                       ("LCA_STEER_LOOSELY_INV", -615)):
+    for key, value in (("RIGHT_TORQUE_AUTHORITY", 615),
+                       ("LEFT_TORQUE_AUTHORITY", -615)):
       invalid = valid | {key: value}
       self.assertFalse(self._tx(self.mid_packer.make_can_msg_safety(
         "LCA", VOLVO_PARTY_BUS, invalid)))
@@ -303,6 +248,82 @@ class TestVolvoSafetyBase(common.CarSafetyTest):
 
   # ---- Volvo-specific consistency tests ----
 
+  def _tx_replacement(self, addr):
+    bus = VOLVO_PARTY_BUS if addr in _TX_PARTY_BUS_ADDRS else VOLVO_MAIN_BUS
+    return self._tx(common.make_msg(bus, addr))
+
+  def test_fwd_hook_forwards_stock_until_openpilot_sends(self):
+    """Being allowed to steer isn't enough to block stock traffic: openpilot has to actually send."""
+    self.safety.set_controls_allowed(True)
+    for addr, stock_bus in _REPLACED_STOCK_BUS.items():
+      self.assertEqual(FWD_BUS[stock_bus], self.safety.safety_fwd_hook(stock_bus, addr), hex(addr))
+
+  def test_fwd_hook_blocks_stock_while_openpilot_sends(self):
+    self.safety.set_controls_allowed(True)
+    for addr, stock_bus in _REPLACED_STOCK_BUS.items():
+      with self.subTest(addr=hex(addr)):
+        self.safety.set_timer(1_000_000)
+        self.assertTrue(self._tx_replacement(addr))
+        self.assertEqual(-1, self.safety.safety_fwd_hook(stock_bus, addr))
+
+        # still blocked right up to the timeout, then stock takes over again
+        self.safety.set_timer(1_000_000 + _REPLACED_TIMEOUT_US[addr])
+        self.assertEqual(-1, self.safety.safety_fwd_hook(stock_bus, addr))
+        self.safety.set_timer(1_000_000 + _REPLACED_TIMEOUT_US[addr] + 1)
+        self.assertEqual(FWD_BUS[stock_bus], self.safety.safety_fwd_hook(stock_bus, addr))
+
+  def test_fwd_hook_stall_hands_back_to_stock(self):
+    """An openpilot stall (no sends for 150 ms) must not leave any replaced address silent."""
+    self.safety.set_controls_allowed(True)
+    self.safety.set_timer(1_000_000)
+    for addr in _REPLACED_STOCK_BUS:
+      self.assertTrue(self._tx_replacement(addr))
+    self.safety.set_timer(1_000_000 + 150_000)
+    self.assertTrue(self.safety.get_controls_allowed())
+    for addr, stock_bus in _REPLACED_STOCK_BUS.items():
+      self.assertEqual(FWD_BUS[stock_bus], self.safety.safety_fwd_hook(stock_bus, addr), hex(addr))
+
+  def test_fwd_hook_only_blocks_the_stock_side(self):
+    """Replacing an address only blocks it arriving from the stock side, not the other way."""
+    self.safety.set_controls_allowed(True)
+    self.safety.set_timer(1_000_000)
+    for addr, stock_bus in _REPLACED_STOCK_BUS.items():
+      self.assertTrue(self._tx_replacement(addr))
+      other_bus = FWD_BUS[stock_bus]
+      self.assertEqual(stock_bus, self.safety.safety_fwd_hook(other_bus, addr), hex(addr))
+
+  def test_fwd_hook_ignores_rejected_tx(self):
+    """A replacement the safety rejects never reaches the bus, so the stock frame keeps forwarding."""
+    self._reset_angle_measurement(0)
+    self.safety.set_controls_allowed(False)
+    self.safety.set_desired_angle_last(0)
+    self.assertFalse(self._tx(self._angle_cmd_msg(20)))
+    self.assertEqual(VOLVO_PARTY_BUS, self.safety.safety_fwd_hook(VOLVO_MAIN_BUS, VOLVO_LCA_5))
+
+  def test_fwd_hook_timeout_across_timer_wrap(self):
+    self.safety.set_controls_allowed(True)
+    start = 0xFFFFF000
+    self.safety.set_timer(start)
+    self.assertTrue(self._tx_replacement(VOLVO_LCA_STEER))
+    self.safety.set_timer((start + _REPLACED_TIMEOUT_US[VOLVO_LCA_STEER]) & 0xFFFFFFFF)
+    self.assertEqual(-1, self.safety.safety_fwd_hook(VOLVO_MAIN_BUS, VOLVO_LCA_STEER))
+    self.safety.set_timer((start + _REPLACED_TIMEOUT_US[VOLVO_LCA_STEER] + 1) & 0xFFFFFFFF)
+    self.assertEqual(VOLVO_PARTY_BUS, self.safety.safety_fwd_hook(VOLVO_MAIN_BUS, VOLVO_LCA_STEER))
+
+  def test_fwd_hook_cleared_on_safety_init(self):
+    self.safety.set_controls_allowed(True)
+    self.safety.set_timer(1_000_000)
+    self.assertTrue(self._tx_replacement(VOLVO_LCA_STEER))
+    self.safety.set_safety_hooks(SAFETY_VOLVO, self.SAFETY_PARAM)
+    self.assertEqual(VOLVO_PARTY_BUS, self.safety.safety_fwd_hook(VOLVO_MAIN_BUS, VOLVO_LCA_STEER))
+
+  def test_unmodified_lca_messages_are_forwarded_not_sent(self):
+    """LCA_6/LCA_7 aren't changed by openpilot, so they're forwarded and never TX'able."""
+    self.safety.set_controls_allowed(True)
+    for addr in (VOLVO_LCA_6, VOLVO_LCA_7):
+      self.assertFalse(self._tx(common.make_msg(VOLVO_PARTY_BUS, addr)))
+      self.assertEqual(VOLVO_PARTY_BUS, self.safety.safety_fwd_hook(VOLVO_MAIN_BUS, addr))
+
   def test_tx_hook_wrong_bus_blocked(self):
     """
     Every TX address is pinned to exactly one bus by the VOLVO_TX_MSGS
@@ -326,8 +347,7 @@ class TestVolvoSafetyBase(common.CarSafetyTest):
   def test_gas_threshold_self_consistent(self):
     """
     Sanity: the panda's gas_pressed edge is exactly where GAS_PRESSED_THRESHOLD
-    is defined. Regression guard for the CMA-vs-SPA scale mismatch bug where
-    carstate.py applied CMA thresholds (raw 0-255) to SPA's DBC-scaled percent.
+    is defined, and carstate.py must use the same percent threshold.
     If you change the threshold in volvo.h, update carstate.py AND this test.
     """
     # Just below threshold → not pressed. Use a value strictly less than threshold.
@@ -467,55 +487,6 @@ class TestVolvoSafetyBase(common.CarSafetyTest):
     # Now the same steering command away from measured must be allowed.
     self.safety.set_desired_angle_last(0)
     self.assertTrue(self._tx(self._angle_cmd_msg(small_angle)))
-
-
-class TestVolvoCMA(TestVolvoSafetyBase):
-  """
-  Volvo CMA: XC40 Recharge.
-
-  ECM_1.ACCELERATOR_PEDAL_POS is raw 0-255 (DBC factor 1). Idle is ~20; panda
-  fires gas_pressed above 21. carstate.py uses the same raw threshold.
-  """
-  SAFETY_PARAM = 0
-  PT_DBC = "volvo_front_1_cma"
-  GAS_PRESSED_THRESHOLD = 21  # raw counts
-
-  def _user_gas_msg(self, gas):
-    values = {"ACCELERATOR_PEDAL_POS": gas}
-    return self.pt_packer.make_can_msg_safety("ECM_1", VOLVO_PT_BUS, values)
-
-  def _pcm_status_msg(self, enable):
-    # CMA cruise is a pair of bools; either one being high enables cruise.
-    values = {"CRUISE_CONTROL_ENABLED": 1 if enable else 0,
-              "CRUISE_CONTROL_ENABLED_IDLE_TRAFFIC": 0}
-    return self.pt_packer.make_can_msg_safety(
-      "BUS1_CRUISE_CONTROL", VOLVO_PT_BUS, values)
-
-
-class TestVolvoSPA(TestVolvoSafetyBase):
-  """
-  Volvo SPA: S60 Recharge, Polestar 2.
-
-  ECM_1.ACCELERATOR_PEDAL_POS is DBC-scaled to percent (factor 0.00390625,
-  range 0-100%). Idle is ~0; panda fires gas_pressed above 1.0%.
-  carstate.py MUST use the same percent-based threshold — see
-  opendbc/car/volvo/carstate.py. A mismatch here manifests in test_models.py
-  as persistent ``panda safety doesn't agree with openpilot: {'gasPressed': N}``.
-  """
-  SAFETY_PARAM = VOLVO_FLAG_SPA
-  PT_DBC = "volvo_front_1_spa"
-  GAS_PRESSED_THRESHOLD = 1.0  # percent
-
-  def _user_gas_msg(self, gas):
-    values = {"ACCELERATOR_PEDAL_POS": gas}
-    return self.pt_packer.make_can_msg_safety("ECM_1", VOLVO_PT_BUS, values)
-
-  def _pcm_status_msg(self, enable):
-    # SPA cruise signal has DBC factor -1 offset 1, so the "enabled" DBC value
-    # is 1 (which encodes as raw bit 0 — panda inverts it).
-    values = {"CRUISE_CONTROL_SPA_ENABLED": 1 if enable else 0}
-    return self.pt_packer.make_can_msg_safety(
-      "BUS1_CRUISE_CONTROL", VOLVO_PT_BUS, values)
 
 
 class TestVolvoC1(common.CarSafetyTest, common.AngleSteeringSafetyTest):

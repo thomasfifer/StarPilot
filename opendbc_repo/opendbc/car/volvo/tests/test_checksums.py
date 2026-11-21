@@ -3,7 +3,46 @@ import unittest
 from opendbc.car.volvo.helpers import (
   checksum_1_pscm_related_message,
   checksum_2_pscm_related_message,
+  checksum_2_lca_2_message,
+  checksum_lca_5_message,
 )
+
+# Stock LCA_2 (0x69) frames from a drive on 2026-11-18, one per byte-1 value seen: the
+# 4-bit counter with PILOT_ASSIST_ENGAGED (byte 1 bit 4) both off and on, since that is
+# the bit openpilot changes. CHECKSUM_2 (byte 2) covers bytes 0, 1, 3 and 4.
+LCA_2_FRAMES = [
+  "1800d60000b6f700", "1801bc0000b80200", "1802020000ba2500", "1803680000bc4c00",
+  "1804630000be6b00", "1805090000b10300", "1806b70000b32400", "1807dd0000b54d00",
+  "1808a10000b76a00", "1809cb0000b99f00", "180a750000bbb800", "180b1f0000bdd100",
+  "180c140000b09e00", "180d7e0000b2b900", "180ec00000b4d000",
+  "18104b0000b09e00", "1811210000b2b900", "18129f0000b4d000", "1813f50000b6f700",
+  "1814fe0000b80200", "1815940000ba2500", "18162a0000bc4c00", "1817400000be6b00",
+  "18183c0000b10300", "1819560000b32400", "181ae80000b54d00", "181b820000b76a00",
+  "181c890000b99f00", "181de30000bbb800", "181e5d0000bdd100",
+]
+
+# Stock LCA_5 (0x67) frames from the same drive: for every counter value (0-14, byte 3
+# high nibble), one at standstill, one moving, and one with stock commanding an angle
+# (bytes 6-7 != ba00). Plus a stock frame from an earlier drive. CHECKSUM (byte 2) covers
+# bytes 0, 1, 3, 4 and 5.
+LCA_5_FRAMES = [
+  "80005b0f0000ba00", "90c33b0f2190ba00", "9684a20f2d288012",
+  "8000061f0000ba00", "90c3661f2190ba00", "967d7e1f2d048009",
+  "8000e12f0000ba00", "90b6a82f2178ba00", "9684972f2d12800a",
+  "8000bc3f0000ba00", "90c8f33f218cba00", "9684243f2d22800e",
+  "8000324f0000ba00", "90c3444f2182ba00", "9675f54f2d08800a",
+  "80006f5f0000ba00", "90b9f35f2182ba00", "9684975f2d048009",
+  "8000886f0000ba00", "90cde56f2186ba00", "968c416f2d1e800a",
+  "8000d57f0000ba00", "90c84f7f21a6ba00", "9689047f2d228010",
+  "8000898f0000ba00", "90be238f218cba00", "9672558f2d0e800a",
+  "8000d49f0000ba00", "90b1529f2178ba00", "967a589f2d1e8009",
+  "800033af0000ba00", "90c1d9af2178ba00", "968279af2d1e800b",
+  "80006ebf0000ba00", "90c182bf2190ba00", "96946dbf2d188010",
+  "8000e0cf0000ba00", "90c30ecf2186ba00", "967ae2cf2d088009",
+  "8000bddf0000ba00", "90b951df215eba00", "9675aedf2d0e8009",
+  "80005aef0000ba00", "90c3eeef2196ba00", "967aedef2d04800c",
+  "88c04cef1190ba00",
+]
 
 # (b1, b2) -> byte[0], observed on the bus.
 # b1 = SIG1 counter (high nibble) | LCA_ENABLED_ECHO (low nibble), b2 = 0x80 | counter.
@@ -53,6 +92,22 @@ class TestPscmRelatedChecksums(unittest.TestCase):
     for b2, expected in PSCM_RELATED_CHECKSUM_2.items():
       with self.subTest(b2=hex(b2)):
         assert checksum_2_pscm_related_message(b2) == expected
+
+
+class TestLca2Checksum(unittest.TestCase):
+  def test_checksum_2_matches_the_car(self):
+    for frame in LCA_2_FRAMES:
+      d = bytes.fromhex(frame)
+      with self.subTest(frame=frame):
+        assert checksum_2_lca_2_message(d[0], d[1], d[3], d[4]) == d[2]
+
+
+class TestLca5Checksum(unittest.TestCase):
+  def test_checksum_matches_the_car(self):
+    for frame in LCA_5_FRAMES:
+      d = bytes.fromhex(frame)
+      with self.subTest(frame=frame):
+        assert checksum_lca_5_message(d[0], d[1], d[3], d[4], d[5]) == d[2]
 
 
 if __name__ == "__main__":

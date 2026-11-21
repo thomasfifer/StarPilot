@@ -1,58 +1,6 @@
-def checksum_lca_2_message(b0: int, b5: int) -> int:
-  """
-  Compute checksum for VCU1 CAN ID 0x69 from bytes b0 and b5.
+from opendbc.car.volvo.values import CarControllerParams
 
-  b0: first data byte (MSB) of the frame (usually 0x18 in your logs)
-  b5: sixth data byte of the frame (what you called Byte5)
-
-  Returns: checksum byte (0..255) that goes into byte index 6.
-  """
-  if b0 == 0 and b5 == 128: # Hotfix openpilot test (don't know where this alleged test message comes from)
-    return 0
-
-  # Masks per checksum bit (bit 0..7) for b0 and b5
-  M0 = [0x08, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00]
-  M5 = [0x83, 0x86, 0xCF, 0xCD, 0x09, 0x02, 0x44, 0x89]
-
-  def parity8(x: int) -> int:
-    # 1 if x has an odd number of bits set, else 0
-    x ^= x >> 4
-    x ^= x >> 2
-    x ^= x >> 1
-    return x & 1
-
-  b0 &= 0xFF
-  b5 &= 0xFF
-
-  c = 0
-  for bit in range(8):
-    p = 0
-    if M0[bit]:
-      p ^= parity8(b0 & M0[bit])
-    if M5[bit]:
-      p ^= parity8(b5 & M5[bit])
-    c |= (p << bit)
-
-  return c & 0xFF
-
-def checksum_2_0x69_message(b0: int, b1: int, b3: int = 0, b4: int = 0) -> int:
-  """
-  Compute checksum byte (b2) for CAN ID 0x69 (LCA_2 message).
-
-  The checksum depends on bytes 0, 1, 3, and 4. During normal driving (BYTE_1_MSBS_3=0),
-  bytes 3-4 (NEW_SIGNAL_2) are always 0, so only b0 and b1 matter. During stability
-  control events (aquaplaning, etc.), BYTE_1_MSBS_3 becomes non-zero and bytes 3-4
-  contain non-zero values that affect the checksum.
-
-  Args:
-      b0: Byte 0 (usually 0x18)
-      b1: Byte 1 ([7:5] BYTE_1_MSBS_3 | [4] PILOT_ASSIST_ENGAGED | [3:0] COUNTER_1)
-      b3: Byte 3 (NEW_SIGNAL_2 high byte, default 0)
-      b4: Byte 4 (NEW_SIGNAL_2 low byte, default 0)
-
-  Returns:
-      Checksum byte (0-255) for position 2
-  """
+def checksum_2_lca_2_message(b0: int, b1: int, b3: int = 0, b4: int = 0) -> int:
   b0 &= 0xFF
   b1 &= 0xFF
   b3 &= 0xFF
@@ -87,25 +35,6 @@ def checksum_2_0x69_message(b0: int, b1: int, b3: int = 0, b4: int = 0) -> int:
   return c & 0xFF
 
 def checksum_1_pscm_related_message(b1, b2):
-  """
-  Computes checksum #1 (goes in byte[0]) for PSCM-related 0x17 message.
-  Depends only on (byte[1], byte[2]).
-
-  b1 = SIG1 counter (high nibble) | LCA_ENABLED_ECHO (low nibble)
-  b2 = 0x80 | SIG1 counter replica (low nibble)
-
-  Linear over GF(2), same shape as checksum_lca_2_message: each output bit is
-  the parity of a fixed mask over b1 and b2. Solved from 137,965 logged PSCM
-  frames (60 distinct (b1,b2) keys, leave-one-out cross-validated 60/60).
-
-  This replaces a 45-entry lookup table that covered only LCA_ENABLED_ECHO in
-  {0, 1, 4} and returned 0 on a miss. During an ESC intervention the rack
-  reports ECHO=6, so openpilot transmitted 128 consecutive frames with an
-  invalid checksum (0x00) before this fix.
-
-  Note: bit 3 of b1 (LCA_ENABLED_ECHO >= 8) has never been observed on the bus,
-  so its contribution is unconstrained by the data and is taken to be zero.
-  """
   # Masks per checksum bit (bit 0..7) for b1 and b2
   M1 = [0x41, 0x82, 0x55, 0xF3, 0xA7, 0x46, 0x94, 0x20]
   M2 = [0x00, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x80]
@@ -133,11 +62,6 @@ def checksum_1_pscm_related_message(b1, b2):
 
 
 def checksum_2_pscm_related_message(b2):
-  """
-  Computes checksum #2 (goes in byte[3]) for PSCM-related 0x17 message.
-  Depends only on byte[2].
-  """
-
   lut = {
     0x80: 0xBF,
     0x81: 0xF3,
@@ -155,47 +79,10 @@ def checksum_2_pscm_related_message(b2):
     0x8D: 0x84,
     0x8E: 0x50,
   }
-
   return lut.get(b2, 0)
 
 
-def checksum_lca_4_message(*args) -> int:
-  """
-  Placeholder for LCA_4 (0x90) checksum calculation.
-
-  TODO: Implementation will be provided after checksum analysis is complete.
-  For now, returns 0 as a placeholder.
-
-  Args:
-      *args: Byte values needed for checksum calculation (TBD)
-
-  Returns:
-      Checksum byte (0-255)
-  """
-  # Placeholder - will be replaced with actual checksum algorithm
-  return 0
-
-
 def checksum_lca_5_message(byte0: int, byte1: int, byte3: int, byte4: int, byte5: int) -> int:
-  """
-  Calculate checksum for LCA_5 message 0x67 (byte 2)
-
-  Args:
-    byte0: Byte 0 (0-255)
-    byte1: Byte 1 (0-255)
-    byte3: Byte 3 (0-255)
-    byte4: Byte 4 (0-255)
-    byte5: Byte 5 (0-255)
-
-  Returns:
-    int: Checksum value (0-255) for byte 2
-
-  Example:
-    >>> checksum = checksum_lca_5_message(0x80, 0x00, 0x4F, 0x00, 0x00)
-    >>> print(f"0x{checksum:02X}")
-    0x32
-  """
-
   # Helper function to extract a bit (LSB = bit 0)
   def bit(byte_val, pos):
     return (byte_val >> pos) & 1
@@ -277,34 +164,80 @@ def checksum_lca_5_message(byte0: int, byte1: int, byte3: int, byte4: int, byte5
   return checksum
 
 
-# Test examples
-if __name__ == "__main__":
-  print("CAN 0x67 Checksum Calculator")
-  print("=" * 60)
+class LcaAuthorityEnvelope:
+  """Replicates stock Pilot Assist's easy override and bounce-free release"""
+  def __init__(self):
+    self.reset()
 
-  # Test cases
-  tests = [
-    ([0x80, 0x00, 0x4F, 0x00, 0x00, 0xBA, 0x00], 0x32),
-    ([0x80, 0x00, 0x8F, 0x00, 0x00, 0xBA, 0x00], 0x89),
-    ([0x80, 0x00, 0xCF, 0x00, 0x00, 0xBA, 0x00], 0xE0),
-    ([0x80, 0x00, 0x1F, 0x00, 0x00, 0xBA, 0x00], 0x06),
-  ]
+  def reset(self):
+    self.pos = 0.0
+    self.neg = 0.0
+    self._drv_prev = 0.0
+    self._light_frames = 0
+    self._real_off_frames = 1000
+    self._override_active = False
+    self._drv_mag_filt = 0.0
 
-  all_passed = True
-  for i, (bytes_list, expected) in enumerate(tests, 1):
-    calculated = checksum_lca_5_message(*bytes_list[:5])
-    status = "✓" if calculated == expected else "✗"
+  def update(self, steering_torque: float) -> tuple[float, float]:
+    """Advance one frame given driver torque (openpilot convention: > 0 is pushing right)."""
+    P = CarControllerParams
+    DT = 0.01  # 100 Hz
+    drv_mag = abs(steering_torque)
+    drv_rate = drv_mag - self._drv_prev
+    self._drv_prev = drv_mag
+    self._drv_mag_filt = ((1.0 - P.LCA_AUTH_YIELD_LP_ALPHA) * self._drv_mag_filt
+                          + P.LCA_AUTH_YIELD_LP_ALPHA * drv_mag)
 
-    print(f"\nTest {i}: {status}")
-    print(f"  Bytes:      {' '.join(f'{b:02X}' for b in bytes_list)}")
-    print(f"  Expected:   0x{expected:02X}")
-    print(f"  Calculated: 0x{calculated:02X}")
+    if not self._override_active and drv_mag > P.LCA_AUTH_OVERRIDE_ENTER:
+      self._override_active = True
+    elif self._override_active and drv_mag < P.LCA_AUTH_OVERRIDE_EXIT:
+      self._override_active = False
 
-    if calculated != expected:
-      all_passed = False
+    real_override = self._override_active
+    if real_override:
+      self._real_off_frames = 0
+    else:
+      self._real_off_frames += 1
 
-  print("\n" + "=" * 60)
-  if all_passed:
-    print("All tests passed! ✓")
-  else:
-    print("Some tests failed! ✗")
+    if (drv_mag > P.LCA_AUTH_LIGHT_THRESH and
+        drv_rate > P.LCA_AUTH_LIGHT_RISE_DELTA and
+        self._light_frames == 0 and
+        self._real_off_frames > P.LCA_AUTH_LIGHT_COOLDOWN_FRAMES):
+      self._light_frames = P.LCA_AUTH_LIGHT_HOLD_FRAMES
+    else:
+      self._light_frames = max(0, self._light_frames - 1)
+    light_collapse = self._light_frames > 0
+    overriding = real_override or light_collapse
+
+    collapse_rate = P.LCA_AUTH_COLLAPSE_RATE * max(1.0, drv_mag / float(P.LCA_AUTH_OVERRIDE_ENTER))
+    step = collapse_rate * DT
+    if overriding:
+      if self.pos > P.LCA_AUTH_SPLIT or -self.neg > P.LCA_AUTH_SPLIT:
+        # Symmetric collapse phase
+        self.pos = max(float(P.LCA_AUTH_SPLIT), self.pos - step)
+        self.neg = min(-float(P.LCA_AUTH_SPLIT), self.neg + step)
+      else:
+        # Asymmetric plateau phase
+        excess = max(0.0, self._drv_mag_filt - float(P.LCA_AUTH_OVERRIDE_ENTER))
+        yield_signed = float(P.LCA_AUTH_YIELD_BASE) - P.LCA_AUTH_YIELD_SLOPE * excess
+        yield_signed = max(float(P.LCA_AUTH_YIELD_MIN), min(yield_signed, float(P.LCA_AUTH_YIELD_BASE)))
+        if steering_torque > 0:  # driver pushing right
+          target_pos = yield_signed                              # yield arm (+ side)
+          target_neg = -float(P.LCA_AUTH_PLATEAU_COUNTER)        # counter arm
+        else:  # driver pushing left (or zero — default to symmetric collapse direction)
+          target_pos = float(P.LCA_AUTH_PLATEAU_COUNTER)         # counter arm
+          target_neg = -yield_signed                             # yield arm (− side)
+        # Drive each arm toward its plateau target at COLLAPSE_RATE
+        self.pos = max(target_pos, self.pos - step) \
+                   if self.pos > target_pos \
+                   else min(target_pos, self.pos + step)
+        self.neg = min(target_neg, self.neg + step) \
+                   if self.neg < target_neg \
+                   else max(target_neg, self.neg - step)
+    else:
+      # No override → rebuild both arms toward saturation
+      rebuild_step = P.LCA_AUTH_REBUILD_RATE * DT
+      self.pos = min(float(P.LCA_AUTH_MAX), self.pos + rebuild_step)
+      self.neg = max(-float(P.LCA_AUTH_MAX), self.neg - rebuild_step)
+
+    return self.pos, self.neg
