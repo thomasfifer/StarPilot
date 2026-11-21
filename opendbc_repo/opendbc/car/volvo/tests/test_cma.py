@@ -12,7 +12,7 @@ from opendbc.car import Bus, CanData, STD_CARGO_KG, gen_empty_fingerprint, struc
 from opendbc.car.car_helpers import interfaces
 from opendbc.car.fingerprints import all_legacy_fingerprint_cars, eliminate_incompatible_cars
 from opendbc.car.volvo.carcontroller import CarController
-from opendbc.car.volvo.carstate import CarState
+from opendbc.car.volvo.carstate import AOL_ALTERNATIVE_EXPERIENCE, CarState
 from opendbc.car.volvo.fingerprints import FINGERPRINTS
 from opendbc.car.volvo.helpers import (checksum_1_lca_2_message, checksum_1_pscm_related_message, checksum_2_lca_2_message,
                                       checksum_2_pscm_related_message, checksum_lca_5_message)
@@ -88,8 +88,10 @@ def _can_data(msg):
   return CanData(address, data, bus)
 
 
-def _make_state():
+def _make_state(aol_enabled=False):
   cp = CarInterface.get_non_essential_params(CAR.VOLVO_XC40_RECHARGE)
+  if aol_enabled:
+    cp.alternativeExperience = AOL_ALTERNATIVE_EXPERIENCE
   cs = CarState(cp)
   parsers = CarState.get_can_parsers(cp)
   packers = {bus: CANPacker(DBC[cp.carFingerprint][bus]) for bus in (Bus.main, Bus.pt, Bus.party)}

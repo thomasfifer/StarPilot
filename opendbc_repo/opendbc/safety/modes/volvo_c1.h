@@ -197,7 +197,13 @@ static safety_config volvo_c1_init(uint16_t param) {
     {.msg = {{VOLVO_C1_PEDAL_AND_BRAKE, VOLVO_C1_PT_BUS, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
     {.msg = {{VOLVO_C1_SPEED, VOLVO_C1_PT_BUS, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
   };
-  return BUILD_SAFETY_CFG(volvo_c1_rx_checks, VOLVO_C1_TX_MSGS);
+  safety_config ret = BUILD_SAFETY_CFG(volvo_c1_rx_checks, VOLVO_C1_TX_MSGS);
+  if ((unsigned int)alternative_experience == 32U) {
+    // C1 has no AOL profile; an AOL-marked configuration may not transmit.
+    ret.tx_msgs = NULL;
+    ret.tx_msgs_len = 0;
+  }
+  return ret;
 }
 
 const safety_hooks volvo_c1_hooks = {

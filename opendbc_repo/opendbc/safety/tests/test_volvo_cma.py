@@ -19,9 +19,13 @@ from opendbc.car.volvo.values import VolvoSafetyFlags
 from opendbc.safety.tests.libsafety import libsafety_py
 import opendbc.safety.tests.common as common
 from opendbc.car.volvo.helpers import pscm_status_supported
-from opendbc.car.volvo.tests.test_cma import _pscm_related, checksummed_lca_2
+from opendbc.car.volvo.tests.test_cma import _pscm_related, _pscm_related_supported, checksummed_lca_2
 from opendbc.car.volvo.tests.test_cma_integrity import LCA_2_FRAMES
 from opendbc.safety.tests.common import CANPackerSafety
+
+# Must match VOLVO_AOL_ENTRY_WINDOW_US in volvo_cma.h and AOL_ENTRY_WINDOW_FRAMES in carstate.py
+VOLVO_AOL_ENTRY_WINDOW_US = 500000
+VOLVO_AOL_ALTERNATIVE_EXPERIENCE = 32
 
 # Must match VOLVO_FLAG_C1 in opendbc/safety/modes/volvo_dispatch.h
 VOLVO_FLAG_C1 = VolvoSafetyFlags.C1.value
@@ -361,6 +365,201 @@ class TestVolvoCMA(common.CarSafetyTest):
       self.assertIsNotNone(m, f"could not find the speed LSB in {name}")
       self.assertEqual(float(m.group(1)), VOLVO_SPEED_TO_MS,
                        f"{name} speed LSB disagrees with test_volvo_cma.py")
+
+
+class TestVolvoCMAAol(unittest.TestCase):
+  """Native Always On Lateral policy for SPA (alternative experience 32, param 0).
+
+  An off->on->off cruise tap inside VOLVO_AOL_ENTRY_WINDOW_US arms lateral-only
+  permission; any later cruise edge disarms it. Permission additionally needs a
+  fresh host request, an engaged heartbeat, Drive/B and fresh cruise/gear sources.
+  """
+
+  def setUp(self):
+    self.pt_packer = CANPackerSafety("volvo_front_1_spa")
+    self.mid_packer = CANPackerSafety("volvo_mid_1")
+    self.safety = libsafety_py.libsafety
+    self._init(0)
+    self.t_us = 1_000_000
+    self.cruise = False
+
+  def tearDown(self):
+    # libsafety is shared by every test in the process: don't leak the AOL marking.
+    self.safety.set_alternative_experience(0)
+    self.safety.set_aol_test_heartbeat(False)
+
+  def _init(self, param, alternative_experience=VOLVO_AOL_ALTERNATIVE_EXPERIENCE):
+    self.safety.init_tests()
+    self.safety.set_alternative_experience(alternative_experience)
+    self.assertEqual(self.safety.set_safety_hooks(SAFETY_VOLVO, param), 0)
+    self.safety.set_aol_test_heartbeat(True)
+
+  def _rx(self, msg):
+    return self.safety.safety_rx_hook(msg)
+
+  def _cruise(self, enabled):
+    return self.pt_packer.make_can_msg_safety("BUS1_CRUISE_CONTROL", VOLVO_PT_BUS, {"CRUISE_CONTROL_SPA_ENABLED": int(enabled)})
+
+  def _gear(self, gear):
+    return self.mid_packer.make_can_msg_safety("GEAR_POSITION", VOLVO_MAIN_BUS, {"GEAR_POSITION": gear})
+
+  def step(self, dt_us, *, cruise=None, gear=3, request=1, brake=False, gas=0.0, send_cruise=True):
+    """Advance time, feed every monitored SPA source (as the car does), renew the host
+    request, and return the permission mask. cruise=None keeps the previous cruise state."""
+    self.t_us += dt_us
+    self.safety.set_timer(self.t_us)
+    if cruise is not None:
+      self.cruise = cruise
+    mid = [("SPEED", VOLVO_MAIN_BUS, {"SPEED": round(10 / VOLVO_SPEED_TO_MS)}), ("SPEED_2", VOLVO_MAIN_BUS, {}),
+           ("LCA", VOLVO_MAIN_BUS, {}),
+           ("LCA_3", VOLVO_MAIN_BUS, {}), ("LCA_4", VOLVO_MAIN_BUS, {}), ("LCA_5", VOLVO_MAIN_BUS, {}),
+           ("LCA_6", VOLVO_MAIN_BUS, {}), ("LCA_7", VOLVO_MAIN_BUS, {}),
+           ("PSCM", VOLVO_PARTY_BUS, {}), ("DRIVER_INPUT", VOLVO_PARTY_BUS, {}), ("EGSM", VOLVO_PARTY_BUS, {}),
+           ("SAS", VOLVO_PARTY_BUS, {})]
+    for name, bus, values in mid:
+      self.assertTrue(self._rx(self.mid_packer.make_can_msg_safety(name, bus, values)), name)
+    address, data, bus = checksummed_lca_2({"BRAKE_PEDAL_PRESSED_B": int(brake)})
+    self.assertTrue(self._rx(libsafety_py.make_CANPacket(address, bus, data)), "LCA_2")
+    self.assertTrue(self._rx(libsafety_py.make_CANPacket(VOLVO_PSCM_RELATED, VOLVO_PARTY_BUS, _pscm_related_supported())),
+                    "PSCM_RELATED")
+    self.assertTrue(self._rx(self.pt_packer.make_can_msg_safety("ECM_1", VOLVO_PT_BUS, {"ACCELERATOR_PEDAL_POS": gas})))
+    if gear is not None:
+      self.assertTrue(self._rx(self._gear(gear)))
+    if send_cruise:
+      self.assertTrue(self._rx(self._cruise(self.cruise)))
+    self.safety.safety_tick()
+    self.safety.aol_set_host_request(request)
+    return self.safety.aol_get_permission_mask()
+
+  def tap(self, hold_us=200_000):
+    """Fast off->on->off cruise tap."""
+    self.step(10_000, cruise=False)
+    self.step(10_000, cruise=True)
+    return self.step(hold_us, cruise=False)
+
+  def test_gear_signal_layout(self):
+    for gear, drive in ((0, False), (1, False), (2, False), (3, True), (4, True)):
+      with self.subTest(gear=gear):
+        self.assertEqual(self._gear(gear)[0].data[7] & 0x7, gear)
+        self._init(0)
+        self.tap()
+        self.assertEqual(self.step(10_000, gear=gear), int(drive))
+
+  def test_fast_tap_arms_lateral_only(self):
+    self.assertEqual(self.step(10_000, cruise=False, request=3), 0)
+    self.step(10_000, cruise=True, request=3)
+    self.assertEqual(self.step(200_000, cruise=False, request=3), 1)
+    self.assertFalse(self.safety.get_controls_allowed(), "AOL must not set controls_allowed")
+    self.assertEqual(self.step(10_000, request=3), 1)
+
+  def test_slow_tap_does_not_arm(self):
+    self.assertEqual(self.tap(hold_us=VOLVO_AOL_ENTRY_WINDOW_US + 100_000), 0)
+
+  def test_any_cruise_edge_disarms_and_cancel_does_not_rearm(self):
+    self.assertEqual(self.tap(), 1)
+    # A normal engagement disarms the tap but is itself a lateral grant.
+    self.assertEqual(self.step(10_000, cruise=True, request=3), 3)
+    # The brake cancels stock cruise inside the original tap window: no stale re-arm.
+    self.assertEqual(self.step(10_000, cruise=False, brake=True, request=3), 0)
+    self.assertEqual(self.step(10_000, request=3), 0)
+    self.assertEqual(self.tap(), 1)
+
+  def test_normal_engagement_grants_lateral_and_stock_cruise_eligibility(self):
+    self.step(10_000, cruise=False)
+    self.assertEqual(self.step(10_000, cruise=True, request=3), 3)
+    self.assertTrue(self.safety.get_controls_allowed())
+    self.assertEqual(self.step(10_000, request=1), 1)
+    self.assertEqual(self.step(10_000, request=2), 2)
+
+  def test_requires_drive_and_fresh_sources(self):
+    self.assertEqual(self.tap(), 1)
+    self.assertEqual(self.step(10_000, gear=1), 0)  # reverse
+    self.assertEqual(self.step(10_000, gear=4), 1)  # B-Mode is Drive
+    self.assertEqual(self.step(10_000, gear=0), 0)  # park
+    self.assertEqual(self.step(10_000, gear=3), 1)
+    # Gear source goes silent past its bound.
+    self.assertEqual(self.step(310_000, gear=None), 0)
+    self.assertEqual(self.step(10_000), 1)
+    # Cruise source goes silent past its bound; the armed state itself is retained.
+    for _ in range(11):
+      mask = self.step(100_000, send_cruise=False)
+    self.assertEqual(mask, 0)
+    self.assertEqual(self.step(10_000), 1)
+
+  def test_host_request_heartbeat_and_relay_gate_permission(self):
+    self.assertEqual(self.tap(), 1)
+    self.assertEqual(self.step(10_000, request=0), 0)
+    self.assertEqual(self.step(10_000, request=1), 1)
+    self.safety.set_timer(self.t_us + 300_001)  # host request lease expired
+    self.assertEqual(self.safety.aol_get_permission_mask(), 0)
+    self.assertEqual(self.step(10_000), 1)
+    self.safety.set_aol_test_heartbeat(False)
+    self.assertEqual(self.safety.aol_get_permission_mask(), 0)
+    self.safety.set_aol_test_heartbeat(True)
+    self.safety.set_relay_malfunction(True)
+    self.assertEqual(self.safety.aol_get_permission_mask(), 0)
+
+  def test_permission_gates_the_steering_command(self):
+    pscm = self.mid_packer.make_can_msg_safety("PSCM", VOLVO_PARTY_BUS, {"PSCM_ANGLE_SENSOR": 0})
+    speed = self.mid_packer.make_can_msg_safety("SPEED", VOLVO_MAIN_BUS, {"SPEED": round(10 / VOLVO_SPEED_TO_MS)})
+    for _ in range(common.MAX_SAMPLE_VALS):
+      self._rx(pscm)
+      self._rx(speed)
+    cmd = self.mid_packer.make_can_msg_safety("LCA_5", VOLVO_PARTY_BUS, {"LCA_5_STEER": 1.0})
+
+    self.step(10_000, cruise=False)
+    self.safety.set_desired_angle_last(0)
+    self.assertFalse(self.safety.safety_tx_hook(cmd), "unarmed AOL must not steer")
+    self.assertEqual(self.tap(), 1)
+    self.safety.set_desired_angle_last(0)
+    self.assertTrue(self.safety.safety_tx_hook(cmd))
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.step(10_000, request=0)
+    self.safety.set_desired_angle_last(0)
+    self.assertFalse(self.safety.safety_tx_hook(cmd), "no host request, no steering")
+
+  def test_armed_aol_keeps_steering_through_brake_and_gas(self):
+    pscm = self.mid_packer.make_can_msg_safety("PSCM", VOLVO_PARTY_BUS, {"PSCM_ANGLE_SENSOR": 0})
+    for _ in range(common.MAX_SAMPLE_VALS):
+      self._rx(pscm)
+    cmd = self.mid_packer.make_can_msg_safety("LCA_5", VOLVO_PARTY_BUS, {"LCA_5_STEER": 1.0})
+    self.assertEqual(self.tap(), 1)
+    for pedals in ({"brake": True}, {"gas": 50.0}, {"brake": True, "gas": 50.0}):
+      with self.subTest(**pedals):
+        self.assertEqual(self.step(10_000, request=3, **pedals), 1, "lateral stays; stock-cruise long eligibility does not")
+        self.safety.set_desired_angle_last(0)
+        self.assertTrue(self.safety.safety_tx_hook(cmd))
+    self.assertEqual(self.step(10_000), 1)  # pedals released: still armed, no re-tap
+
+  def test_invalid_frame_withdraws_until_the_next_valid_one_without_disarming(self):
+    self.assertEqual(self.tap(), 1)
+    address, data, bus = checksummed_lca_2()
+    corrupt_lca_2 = bytearray(data)
+    corrupt_lca_2[6] ^= 1
+    unsupported_rack = _pscm_related(0x51 | 0x8, 0x85)  # LCA_ENABLED_ECHO bit3 set, valid checksums
+    for frame in (libsafety_py.make_CANPacket(address, bus, bytes(corrupt_lca_2)),
+                  libsafety_py.make_CANPacket(VOLVO_PSCM_RELATED, VOLVO_PARTY_BUS, unsupported_rack)):
+      with self.subTest(addr=hex(frame[0].addr)):
+        self.assertFalse(self._rx(frame))
+        self.safety.aol_set_host_request(1)
+        self.assertEqual(self.safety.aol_get_permission_mask(), 0)
+        self.assertEqual(self.step(10_000), 1)  # next valid frames restore it, still armed
+
+  def test_without_aol_marking_there_is_no_policy(self):
+    self._init(0, alternative_experience=0)
+    self.assertEqual(self.tap(), 0)
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_c1_has_no_aol_profile_and_aol_marking_blocks_tx(self):
+    self._init(VOLVO_FLAG_C1)
+    self.safety.set_controls_allowed(True)
+    msg = CANPackerSafety("volvo_v40_2017_pt").make_can_msg_safety("CCButtons", VOLVO_MAIN_BUS, {"ACCStopBtn": 1})
+    self.assertFalse(self.safety.safety_tx_hook(msg))
+
+  def test_entry_window_matches_carstate(self):
+    path = pathlib.Path(__file__).parents[2] / "car/volvo/carstate.py"
+    frames = int(re.search(r"^AOL_ENTRY_WINDOW_FRAMES\s*=\s*(\d+)", path.read_text(), re.MULTILINE).group(1))
+    self.assertEqual(frames * 10_000, VOLVO_AOL_ENTRY_WINDOW_US)
 
 
 class TestVolvoCMAIntegrity(unittest.TestCase):

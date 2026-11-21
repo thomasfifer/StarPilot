@@ -16,19 +16,24 @@ def params(identity=CAR.VOLVO_V60, alternative=32):
   return cp
 
 
-def test_only_the_v60_is_admitted():
-  assert aol.qualified(params(), marked_only=True)
-  assert aol.qualified(params(alternative=0)) and not aol.qualified(params(alternative=0), marked_only=True)
+def test_only_the_v60_is_admitted_as_eucd():
+  assert aol.eucd_qualified(params(), marked_only=True)
+  assert aol.eucd_qualified(params(alternative=0)) and not aol.eucd_qualified(params(alternative=0), marked_only=True)
   for identity in (CAR.VOLVO_V40, CAR.VOLVO_XC40_RECHARGE, CAR.VOLVO_S60_RECHARGE, CAR.POLESTAR_2):
-    assert not aol.qualified(params(identity))
-    assert not aol.policy_for(params(identity)).intent_supported
+    assert not aol.eucd_qualified(params(identity))
+  # The SPA cars have their own cruise double-tap port (test_aol_spa.py); C1 (V40) has none.
+  assert not aol.qualified(params(CAR.VOLVO_V40))
+  assert not aol.policy_for(params(CAR.VOLVO_V40)).intent_supported
   assert aol.policy_for(params()).intent_supported
+  assert aol.policy_for(params()).lkas_button_supported
+  assert isinstance(aol.create_intent(params(), read_settings(FakeParams())), aol.VolvoEucdCardIntent)
 
 
 def test_exact_native_profile():
   model = int(structs.CarParams.SafetyModel.volvo)
   assert aol.native_profile_supported(model, 8)
-  for param in (0, 1, 2, 4, 5):
+  assert aol.native_profile_supported(model, 0)  # SPA
+  for param in (1, 2, 4, 5):
     assert not aol.native_profile_supported(model, param)
   assert not aol.native_profile_supported(model + 1, 8)
   assert aol.native_accepts_cp(params(), model, 8)

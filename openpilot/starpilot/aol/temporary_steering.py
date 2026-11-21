@@ -155,6 +155,10 @@ def temporary_steering_intent_current(self, sm, cp, cs, axis, stamp, now_ns, *, 
   stock_rivian_eps = bool(rivian_temporary_eps_restriction(cp, cs) and
     all(not event.userDisable or event.name == log.OnroadEvent.EventName.pcmDisable and
         not event.softDisable and not event.immediateDisable for event in events))
+  from openpilot.starpilot.car.volvo.aol import temporary_eps_restriction as volvo_temporary_eps_restriction
+  stock_volvo_eps = bool(volvo_temporary_eps_restriction(cp, cs) and
+    all(not event.userDisable or event.name == log.OnroadEvent.EventName.pcmDisable and
+        not event.softDisable and not event.immediateDisable for event in events))
   from openpilot.starpilot.car.volkswagen.aol import temporary_eps_restriction as volkswagen_temporary_eps_restriction
   stock_volkswagen_eps = bool(volkswagen_temporary_eps_restriction(cp, cs) and
     all(not event.userDisable or event.name == log.OnroadEvent.EventName.pcmDisable and
@@ -178,7 +182,7 @@ def temporary_steering_intent_current(self, sm, cp, cs, axis, stamp, now_ns, *, 
     all(not event.userDisable for event in events))
   ford_alpha_eps = bool(stock_ford_eps and cp.openpilotLongitudinalControl)
   restricted_eps = bool((temporary_eps_restriction(cp, cs) or stock_ford_eps or stock_mazda_eps or stock_rivian_eps or
-                        stock_volkswagen_eps or stock_subaru_eps) and self.lateral_only_baseline and
+                        stock_volvo_eps or stock_volkswagen_eps or stock_subaru_eps) and self.lateral_only_baseline and
     not axis.desiredLongitudinal and not axis.longitudinalActive) or ford_alpha_eps or hkg_angle_eps or honda_eps
   native = _configured_transport_native(sm, cp, self.session, now_ns,
     require_longitudinal=not ford_alpha_eps or axis.longitudinalActive, allow_restricted_lateral=restricted_eps)

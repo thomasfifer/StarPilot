@@ -443,6 +443,7 @@ class TransportPauseFeedback:
     from openpilot.starpilot.car.nissan.aol import qualified as nissan_qualified
     from opendbc.car.ford.aol import qualified as ford_qualified
     from opendbc.car.rivian.stock_aol import qualified as rivian_qualified
+    from openpilot.starpilot.car.volvo.aol import qualified as volvo_qualified
     from openpilot.starpilot.car.volkswagen.aol import qualified as volkswagen_qualified
     from opendbc.car.mazda.stock_aol import qualified as mazda_qualified
     from opendbc.car.subaru.stock_aol import qualified as subaru_qualified
@@ -462,6 +463,7 @@ class TransportPauseFeedback:
       or cp.brand == 'subaru' and subaru_qualified(cp, marked_only=True)
       or cp.brand == 'mazda' and mazda_qualified(cp, marked_only=True)
       or cp.brand == 'rivian' and rivian_qualified(cp, marked_only=True)
+      or cp.brand == 'volvo' and volvo_qualified(cp, marked_only=True)
       or cp.brand == 'volkswagen' and volkswagen_qualified(cp, marked_only=True)) and users and
       not axis.desiredLongitudinal and not axis.longitudinalActive and
       (cs.cruiseState.available or classic_eps_recovery) and not cs.cruiseState.enabled and
@@ -1471,6 +1473,14 @@ class TransportPauseFeedback:
 
         if retain_reverse_intent(self, sm, cp, cs, axis, now_ns, latched=latched, producer=intent_producer_session,
             qualified_cp=rivian_qualified(cp, marked_only=True),
+            informational_events=(log.OnroadEvent.EventName.userBookmarkNotPaired,), allow_withdrawal_join=True):
+          return False
+      if cp.brand == 'volvo' and current and continuity:
+        from openpilot.starpilot.car.volvo.aol import qualified as volvo_qualified
+        from openpilot.starpilot.aol.reverse_intent import retain_reverse_intent
+
+        if retain_reverse_intent(self, sm, cp, cs, axis, now_ns, latched=latched, producer=intent_producer_session,
+            qualified_cp=volvo_qualified(cp, marked_only=True),
             informational_events=(log.OnroadEvent.EventName.userBookmarkNotPaired,), allow_withdrawal_join=True):
           return False
       if cp.brand == 'nissan' and current and continuity:

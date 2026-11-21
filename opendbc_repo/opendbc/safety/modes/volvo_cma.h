@@ -45,6 +45,98 @@
 #define VOLVO_PT_BUS      1U  // Bus.pt - VCU1 ECM side (where ECM is)
 #define VOLVO_PARTY_BUS   2U  // Bus.party - VCU PSCM/BCM2 side (BCM2, SAS, EGSM, PSCM, where LCA is sent to)
 
+// ---- Always On Lateral (SPA, alternative experience 32) ----
+// There is no MAIN switch. An off->on->off tap of stock cruise inside the entry
+// window arms lateral-only control; any later cruise edge disarms it. carstate.py
+// detects the same taps for the host, but only this native state grants permission.
+#define VOLVO_AOL_ENTRY_WINDOW_US 500000U     // 0.5s, matches AOL_ENTRY_WINDOW_FRAMES in carstate.py
+#define VOLVO_AOL_CRUISE_MAX_AGE_US 1000000U  // BUS1_CRUISE_CONTROL is 5 Hz, same 1s lagging floor as its RX check
+#define VOLVO_AOL_GEAR_MAX_AGE_US 300000U     // GEAR_POSITION is 40 Hz
+static bool volvo_aol_enabled = false;
+static bool volvo_aol_armed = false;
+static bool volvo_aol_seen_rising = false;
+static bool volvo_aol_cruise_prev = false;
+static uint32_t volvo_aol_rising_ts = 0U;
+static bool volvo_aol_cruise_seen = false;
+static uint32_t volvo_aol_cruise_ts = 0U;
+static bool volvo_aol_drive = false;
+static bool volvo_aol_gear_seen = false;
+static uint32_t volvo_aol_gear_ts = 0U;
+
+static void volvo_aol_disarm(void) {
+  volvo_aol_armed = false;
+  volvo_aol_seen_rising = false;
+}
+
+static void volvo_aol_reset(void) {
+  volvo_aol_disarm();
+  volvo_aol_cruise_prev = false;
+  volvo_aol_rising_ts = 0U;
+  volvo_aol_cruise_seen = false;
+  volvo_aol_cruise_ts = 0U;
+  volvo_aol_drive = false;
+  volvo_aol_gear_seen = false;
+  volvo_aol_gear_ts = 0U;
+}
+
+static void volvo_aol_cruise(bool cruise_enabled) {
+  const uint32_t ts = microsecond_timer_get();
+  const bool rising = cruise_enabled && !volvo_aol_cruise_prev;
+  const bool falling = !cruise_enabled && volvo_aol_cruise_prev;
+  if (!volvo_aol_armed) {
+    if (rising) {
+      volvo_aol_rising_ts = ts;
+      volvo_aol_seen_rising = true;
+    } else if (falling && volvo_aol_seen_rising && (safety_get_ts_elapsed(ts, volvo_aol_rising_ts) <= VOLVO_AOL_ENTRY_WINDOW_US)) {
+      volvo_aol_armed = true;
+    } else {
+      // normal press outside the entry window: no state change
+    }
+  } else if (falling || rising) {
+    volvo_aol_disarm();
+  } else {
+    // no edge this frame: remain armed
+  }
+  volvo_aol_cruise_prev = cruise_enabled;
+  volvo_aol_cruise_seen = true;
+  volvo_aol_cruise_ts = ts;
+}
+
+static void volvo_aol_gear(const CANPacket_t *msg) {
+  // DBC: SG_ GEAR_POSITION : 58|3@0+ - byte 7 bits 2..0; 3 = Drive, 4 = B-Mode
+  const uint8_t gear = msg->data[7] & 0x7U;
+  volvo_aol_drive = (gear == 3U) || (gear == 4U);
+  volvo_aol_gear_seen = true;
+  volvo_aol_gear_ts = microsecond_timer_get();
+}
+
+static uint8_t volvo_aol_request(void) {
+  uint8_t request = 0U;
+  if (heartbeat_engaged && aol_rx_healthy() && !safety_rx_checks_invalid && !relay_malfunction &&
+      (safety_get_ts_elapsed(microsecond_timer_get(), aol_host_request_ts) <= AOL_HOST_REQUEST_TIMEOUT_US)) {
+    request = aol_host_axis_mask;
+  }
+  return request;
+}
+
+static uint8_t volvo_aol_permission(void) {
+  const uint8_t request = volvo_aol_request();
+  const uint32_t now = microsecond_timer_get();
+  // New optional vehicle-source bound; never renew a source from a host request.
+  const bool fresh = volvo_aol_cruise_seen && (safety_get_ts_elapsed(now, volvo_aol_cruise_ts) <= VOLVO_AOL_CRUISE_MAX_AGE_US) &&
+                     volvo_aol_gear_seen && (safety_get_ts_elapsed(now, volvo_aol_gear_ts) <= VOLVO_AOL_GEAR_MAX_AGE_US);
+  uint8_t permission = 0U;
+  // A normal stock engagement (controls_allowed) also grants lateral, as it did before AOL.
+  if (fresh && volvo_aol_drive && (volvo_aol_armed || controls_allowed)) {
+    permission = request & 1U;
+    // This describes stock cruise eligibility, never adds Volvo longitudinal CAN messages.
+    if (controls_allowed && !brake_pressed && !gas_pressed) {
+      permission |= request & 2U;
+    }
+  }
+  return permission;
+}
+
 // Messages openpilot replaces while actively steering. While openpilot is sending
 // one, the stock version arriving on stock_bus must not also be forwarded. Panda
 // tracks when each was last allowed through volvo_cma_tx_hook and only blocks the stock
@@ -119,6 +211,10 @@ static void volvo_cma_rx_hook(const CANPacket_t *msg) {
     // speed message too, but which car bus lands on PT is harness-dependent and its
     // scaling differs per PT DBC, so both sides read the main bus instead.
     // DBC: SG_ SPEED : 6|15@0+ (1,0) - raw counts, scaled here
+    if (volvo_aol_enabled && (msg->addr == VOLVO_GEAR_POSITION)) {
+      volvo_aol_gear(msg);
+    }
+
     if (msg->addr == VOLVO_SPEED) {
       uint16_t speed_raw = ((msg->data[0] & 0x7FU) << 8) | msg->data[1];
       float speed = (float)speed_raw * VOLVO_SPEED_TO_MS;
@@ -138,6 +234,9 @@ static void volvo_cma_rx_hook(const CANPacket_t *msg) {
     if (msg->addr == VOLVO_SPA_BUS1_CRUISE_CONTROL) {
       // SG_ CRUISE_CONTROL_SPA_ENABLED : 1|1@0+ (-1,1) — byte 0 bit 1, active low
       bool cruise_enabled = !((msg->data[0] >> 1) & 1U);
+      if (volvo_aol_enabled) {
+        volvo_aol_cruise(cruise_enabled);
+      }
       pcm_cruise_check(cruise_enabled);
     }
   }
@@ -300,7 +399,19 @@ static bool volvo_cma_fwd_hook(int bus_num, int addr) {
 }
 
 static safety_config volvo_cma_init(uint16_t param) {
-  (void)param;
+  volvo_aol_reset();
+  volvo_aol_enabled = ((unsigned int)alternative_experience == 32U) && (param == 0U);
+  if (volvo_aol_enabled) {
+    static const AolSafetyPolicy policy = {
+      .reset = volvo_aol_reset,
+      .request_mask = volvo_aol_request,
+      .permission_mask = volvo_aol_permission,
+      // No rx_invalid: a failed checksum or rack-status check withdraws permission for
+      // as long as that receiver is invalid (aol_rx_healthy), but does not disarm. The
+      // driver doesn't have to re-tap once the next valid frame arrives.
+    };
+    aol_policy = &policy;
+  }
   for (uint8_t i = 0U; i < VOLVO_REPLACED_MSG_CNT; i++) {
     volvo_replaced_tx_seen[i] = false;
     volvo_replaced_tx_ts[i] = 0U;
