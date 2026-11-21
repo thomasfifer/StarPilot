@@ -50,8 +50,11 @@ class TestVolvoActualStartup(unittest.TestCase):
     self.assertEqual(card.CP.passive, not enabled)
     self.assertEqual(card.CP.safetyConfigs[0].safetyModel,
                      structs.CarParams.SafetyModel.volvo if enabled else structs.CarParams.SafetyModel.noOutput)
-    self.assertEqual(card.aol_qualified, False)
-    self.assertIsNone(card.aol_card_intent)
+    # Only the CMA layout has an AOL port; C1 and disabled openpilot never qualify.
+    aol_expected = aol and enabled and identity in CMA
+    self.assertEqual(card.aol_qualified, aol_expected)
+    self.assertEqual(card.aol_card_intent is not None, aol_expected)
+    self.assertEqual(card.CP.alternativeExperience, 32 if aol_expected else 0)
     self.assertTrue(params.get_bool('ForceAutoTuneOff'))
     self.assertFalse(params.get_bool('ControlsReady'))
     # Ordinary family path delays init/ControlsReady until valid CAN and controls.

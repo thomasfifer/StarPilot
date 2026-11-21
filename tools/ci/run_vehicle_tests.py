@@ -188,6 +188,7 @@ AOL_LIFECYCLE_TARGETS = (
   "openpilot/starpilot/car/toyota/tests/test_legacy_advert_native.py",
   "openpilot/starpilot/car/toyota/tests/test_legacy_advert_lateral.py",
   "openpilot/starpilot/car/nissan/tests/test_aol.py",
+  "openpilot/starpilot/car/volvo/tests/test_aol.py",
   "openpilot/starpilot/aol/tests/test_volkswagen.py",
   "openpilot/starpilot/aol/tests/test_volkswagen_saved_intent.py",
   "openpilot/starpilot/aol/tests/test_mqb_actual_callers.py",
@@ -252,6 +253,8 @@ AOL_LIFECYCLE_SCOPE = {
   "ford_chrysler": "stock PCM-off EPS/location joins; Chrysler factory/parser/controller OFF and Cancel behavior",
   "toyota": "stock torque/angle native-ack vetoes, source-gap recovery, Lexus IS DSU actual DEBUG/RELEASE native callers",
   "nissan": "five stock identities, real acquisition/parser/controller/native optional paths",
+  "volvo": ("XC40/S60/Polestar 2 SPA stock: cruise double-tap MAIN through actual factory/parser/intent/controller/native, " +
+            "Reverse/Drive, normal engagement and cancel, request lease; C1 and unmarked profiles refused"),
 }
 
 DEBUG_SAFETY_CLASS_TARGETS = {

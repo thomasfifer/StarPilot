@@ -20,4 +20,5 @@ def test_actual_detected_gateway_preserves_auto_and_no_false_torque_learning(det
   torque = gateway.page('torque', 'session', b'generation')
   assert all(row['label'] != 'Use StarPilot Auto Learn' for row in torque['rows'])
   assert params.get_bool('ForceAutoTuneOff')
-  assert not policy_for(cp).intent_supported
+  # CMA/SPA cars have the cruise double-tap AOL port; C1 (V40) has none.
+  assert policy_for(cp).intent_supported == (identity != 'VOLVO_V40')

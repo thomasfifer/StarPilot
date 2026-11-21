@@ -10,6 +10,8 @@ TransmissionType = structs.CarParams.TransmissionType
 
 SPEED_TO_MS = 0.003977 # Must match VOLVO_SPEED_TO_MS in opendbc/safety/modes/volvo_cma.h
 STEERING_PRESSED_THRESHOLD = 2
+AOL_ENTRY_WINDOW_FRAMES = 50  # 0.5s at 100 Hz
+AOL_ALTERNATIVE_EXPERIENCE = 32  # set on CarParams when the AOL policy admits the car
 
 
 class CarState(CarStateBase):
@@ -17,6 +19,11 @@ class CarState(CarStateBase):
     super().__init__(CP)
     self.is_c1 = isinstance(CAR(CP.carFingerprint).config, VolvoC1PlatformConfig)
     self.gas_pressed_prev = False
+    self.aol_frame = 0
+    self.aol_cruise_prev = False
+    self.aol_seen_rising = False
+    self.aol_rising_frame = 0
+    self.aol_armed = False
     self.dispatch_lca_2_msg = False
     self.msg_pscm = {}
     self.msg_lca = {}
@@ -67,7 +74,23 @@ class CarState(CarStateBase):
     cruise_raw = cp_pt.vl["BUS1_CRUISE_CONTROL"]["CRUISE_CONTROL_SPA_ENABLED"] == 1 # inverted (0 = cruise on, 1 = cruise off)
     ret.cruiseState.enabled = cruise_raw
 
-    ret.cruiseState.available = True  # TODO: Determine actual availability
+    if self.CP.alternativeExperience == AOL_ALTERNATIVE_EXPERIENCE:
+      self.aol_frame += 1
+      cruise_rising = cruise_raw and not self.aol_cruise_prev
+      cruise_falling = (not cruise_raw) and self.aol_cruise_prev
+      if not self.aol_armed:
+        if cruise_rising:
+          self.aol_rising_frame = self.aol_frame
+          self.aol_seen_rising = True
+        elif cruise_falling and self.aol_seen_rising and (self.aol_frame - self.aol_rising_frame) <= AOL_ENTRY_WINDOW_FRAMES:
+          self.aol_armed = True
+      elif cruise_falling or cruise_rising:
+        self.aol_armed = False
+        self.aol_seen_rising = False
+      self.aol_cruise_prev = cruise_raw
+      ret.cruiseState.available = self.aol_armed or cruise_raw
+    else:
+      ret.cruiseState.available = True  # TODO: Determine actual availability
 
     self.gas_pressed_prev = ret.gasPressed
     ret.cruiseState.speed = 0  # TODO: Find cruise set speed
