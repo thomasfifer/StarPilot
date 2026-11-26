@@ -12,7 +12,7 @@ from opendbc.car import Bus, CanData, STD_CARGO_KG, gen_empty_fingerprint, struc
 from opendbc.car.car_helpers import interfaces
 from opendbc.car.fingerprints import all_legacy_fingerprint_cars, eliminate_incompatible_cars
 from opendbc.car.volvo.carcontroller import CarController
-from opendbc.car.volvo.carstate import AOL_ALTERNATIVE_EXPERIENCE, CarState
+from opendbc.car.volvo.carstate import AOL_ALTERNATIVE_EXPERIENCE, RELAYED_MAIN, RELAYED_PARTY, CarState
 from opendbc.car.volvo.fingerprints import FINGERPRINTS
 from opendbc.car.volvo.helpers import (checksum_1_lca_2_message, checksum_1_pscm_related_message, checksum_2_lca_2_message,
                                       checksum_2_pscm_related_message, checksum_lca_5_message)
@@ -137,8 +137,11 @@ def _stock_messages(dbc, names):
 
 
 def _state():
+  """A CarState stand-in where one stock frame of every relayed message arrives each frame."""
   msgs = _stock_messages(DBC[CAR.POLESTAR_2][Bus.party], ["LCA", "PSCM", "PSCM_RELATED", "LCA_2", "LCA_3", "LCA_4", "LCA_5"])
   return SimpleNamespace(
+    stock_frames={name: [msgs[name]] for name in RELAYED_MAIN + RELAYED_PARTY},
+    lat_commanding=False,
     out=SimpleNamespace(steeringAngleDeg=0.0, vEgoRaw=12.0, steeringTorque=0.0),
     msg_lca=msgs["LCA"],
     msg_pscm=msgs["PSCM"],

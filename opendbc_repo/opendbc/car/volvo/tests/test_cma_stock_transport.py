@@ -63,15 +63,13 @@ def test_controller_leaves_lca5_to_panda_forwarding_when_inactive(fingerprint):
     _, can_sends = controller.update(cc, cs, 0)
     assert not any(msg[0] == 0x67 for msg in can_sends)
 
-  # Once active, the stock counter is passed straight through (LCA_5 is 50 Hz, so
-  # step until it's sent)
-  cs.msg_lca_5["COUNTER"] = 7
+  # Once active, each stock frame is replaced once with its counter passed straight
+  # through, and nothing is sent for a frame with no new stock LCA_5.
   cc.latActive = True
-  sent = []
-  for _ in range(2):
+  for counters in ([7], [], [11, 0]):
+    cs.stock_frames["LCA_5"] = [{**cs.msg_lca_5, "COUNTER": counter} for counter in counters]
     _, can_sends = controller.update(cc, cs, 0)
-    sent += [msg for msg in can_sends if msg[0] == 0x67]
-  assert len(sent) == 1
-  data = sent[0][1]
-  assert data[3] >> 4 == 7
-  assert data[2] == checksum_lca_5_message(data[0], data[1], data[3], data[4], data[5])
+    sent = [msg[1] for msg in can_sends if msg[0] == 0x67]
+    assert [data[3] >> 4 for data in sent] == counters
+    for data in sent:
+      assert data[2] == checksum_lca_5_message(data[0], data[1], data[3], data[4], data[5])

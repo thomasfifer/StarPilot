@@ -187,6 +187,37 @@ def checksum_lca_5_message(byte0: int, byte1: int, byte3: int, byte4: int, byte5
   return checksum
 
 
+class RackAcceptanceMonitor:
+  """Temporary steer fault while the rack refuses openpilot's LCA commands"""
+  def __init__(self):
+    self.commanding_frames = 0
+    self.refused_frames = 0
+    self.fault_frames = 0
+
+  def update(self, commanding: bool, echo: int) -> bool:
+    """Advance one frame. commanding: openpilot sent steering last frame. Returns the fault."""
+    P = CarControllerParams
+    if self.fault_frames > 0:
+      self.fault_frames -= 1
+      self.commanding_frames = 0
+      self.refused_frames = 0
+      return True
+
+    if not commanding:
+      self.commanding_frames = 0
+      self.refused_frames = 0
+      return False
+
+    self.commanding_frames += 1
+    self.refused_frames = self.refused_frames + 1 if echo == 0 else 0
+    if self.commanding_frames > P.RACK_ECHO_GRACE_FRAMES and self.refused_frames >= P.RACK_ECHO_REFUSED_FRAMES:
+      self.fault_frames = P.RACK_ECHO_FAULT_FRAMES - 1
+      self.commanding_frames = 0
+      self.refused_frames = 0
+      return True
+    return False
+
+
 class LcaAuthorityEnvelope:
   """Replicates stock Pilot Assist's easy override and bounce-free release"""
   def __init__(self):

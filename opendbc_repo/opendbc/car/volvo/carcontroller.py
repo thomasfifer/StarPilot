@@ -21,7 +21,7 @@ class CarController(CarControllerBase):
     self.apply_angle_last = 0.0
     self.c1_torque_samples = deque(maxlen=CarControllerParams.C1_N_ZERO_TORQUE)
     self.c1_recovery_until = -1
-    self.lca_4_acc = 0
+    self.lca_5_angle_last = 0.0
     self.lca_auth = LcaAuthorityEnvelope()
 
   def _finish_update(self, actuators, can_sends):
@@ -37,12 +37,14 @@ class CarController(CarControllerBase):
 
   def _update_spa(self, CC, CS):
     actuators = CC.actuators
+    CS.lat_commanding = bool(CC.latActive)  # rack acceptance check on the next CarState update
 
     if not CC.latActive:
       self.apply_angle_last = apply_std_steer_angle_limits(
         actuators.steeringAngleDeg, self.apply_angle_last, CS.out.vEgoRaw, CS.out.steeringAngleDeg,
         False, CarControllerParams.ANGLE_LIMITS,
       )
+      self.lca_5_angle_last = CS.out.steeringAngleDeg
       self.lca_auth.reset()
       return self._finish_update(actuators, [])
 
@@ -66,27 +68,23 @@ class CarController(CarControllerBase):
     # Torque-authority envelope for driver override
     authority_pos, authority_neg = self.lca_auth.update(CS.out.steeringTorque)
 
-    # LCA (0x58), PSCM (0x16, bus 2 -> 0), PSCM_RELATED (0x17, bus 2 -> 0) - 100 Hz
-    can_sends = [
-      create_lca_message(self.packer, CS.msg_lca, authority_pos, authority_neg),
-      create_pscm_message(self.packer, CS.msg_pscm),
-      create_pscm_related_message(self.packer, CS.msg_pscm_related, CS.pilot_assist_engaged),
-    ]
-
-    # LCA_3 (0x57) - avg 66.66 Hz
-    if self.frame % 3 != 1:
-      can_sends.append(create_lca_3_message(self.packer, CS.msg_lca_3))
-
-    # LCA_2 (0x69) and LCA_5 (0x67) - 50 Hz
-    if self.frame % 2 == 0:
-      can_sends.append(create_lca_2_message(self.packer, CS.msg_lca_2))
-      can_sends.append(create_lca_5_message(self.packer, apply_angle, CS.msg_lca_5))
-
-    # LCA_4 (0x90) - 29 Hz
-    self.lca_4_acc += 29
-    if self.lca_4_acc >= 100:
-      self.lca_4_acc -= 100
-      can_sends.append(create_lca_4_message(self.packer, CS.msg_lca_4))
+    frames = CS.stock_frames
+    can_sends = []
+    # LCA (0x58, 100 Hz), PSCM (0x16) and PSCM_RELATED (0x17) relayed party -> main (100 Hz)
+    can_sends += [create_lca_message(self.packer, msg, authority_pos, authority_neg) for msg in frames['LCA']]
+    can_sends += [create_pscm_message(self.packer, msg) for msg in frames['PSCM']]
+    can_sends += [create_pscm_related_message(self.packer, msg, CS.pilot_assist_engaged) for msg in frames['PSCM_RELATED']]
+    # LCA_3 (0x57, ~67 Hz), LCA_2 (0x69, 50 Hz), LCA_4 (0x90, ~29 Hz)
+    can_sends += [create_lca_3_message(self.packer, msg) for msg in frames['LCA_3']]
+    can_sends += [create_lca_2_message(self.packer, msg) for msg in frames['LCA_2']]
+    can_sends += [create_lca_4_message(self.packer, msg) for msg in frames['LCA_4']]
+    # LCA_5 (0x67, 50 Hz) carries the angle command; limited per send against the last one
+    for msg in frames['LCA_5']:
+      self.lca_5_angle_last = apply_std_steer_angle_limits(
+        apply_angle, self.lca_5_angle_last, CS.out.vEgoRaw, CS.out.steeringAngleDeg,
+        True, CarControllerParams.LCA_5_ANGLE_LIMITS,
+      )
+      can_sends.append(create_lca_5_message(self.packer, self.lca_5_angle_last, msg))
 
     return self._finish_update(actuators, can_sends)
 
@@ -120,10 +118,7 @@ class CarController(CarControllerBase):
         CS.out.steeringAngleDeg - CarControllerParams.C1_ANGLE_ERROR,
         CS.out.steeringAngleDeg + CarControllerParams.C1_ANGLE_ERROR,
       ))
-      apply_angle = apply_std_steer_angle_limits(
-        desired_angle, self.apply_angle_last, CS.out.vEgoRaw,
-        CS.out.steeringAngleDeg, lat_active, CarControllerParams.C1_ANGLE_LIMITS,
-      )
+      apply_angle = apply_std_steer_angle_limits(desired_angle, self.apply_angle_last, CS.out.vEgoRaw, CS.out.steeringAngleDeg, lat_active, CarControllerParams.C1_ANGLE_LIMITS)
 
       can_sends.append(create_c1_pscm_message(self.packer, CS.c1_msg_pscm))
       can_sends.append(create_c1_steering_control(self.packer, apply_angle, lat_active))

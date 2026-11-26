@@ -38,6 +38,16 @@ class CarControllerParams:
     ([0., 5., 25.], [2.5, 1.5, .2]),  # rate up limits at different speeds
     ([0., 5., 25.], [5., 2., .3]),    # rate down limits at different speeds
   )
+  # limit per send against the last sent angle at twice the per-frame rates.
+  LCA_5_ANGLE_LIMITS: AngleSteeringLimits = AngleSteeringLimits(
+    540,
+    ([0., 5., 25.], [5., 3., .4]),
+    ([0., 5., 25.], [10., 4., .6]),
+  )
+
+  RACK_ECHO_GRACE_FRAMES = 50    # 0.5 s after openpilot starts steering (20-80 ms observed)
+  RACK_ECHO_REFUSED_FRAMES = 20  # 0.2 s of echo 0 after the grace period
+  RACK_ECHO_FAULT_FRAMES = 100   # hold the fault 1 s, then let openpilot try again
 
   C1_STEER_NO = 0
   C1_STEER = 3
