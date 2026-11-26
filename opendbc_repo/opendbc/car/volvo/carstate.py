@@ -2,7 +2,7 @@ from opendbc.car import Bus, ButtonType, create_button_events, structs
 from opendbc.can.parser import CANParser
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.interfaces import CarStateBase
-from opendbc.car.volvo.helpers import pscm_status_supported
+from opendbc.car.volvo.helpers import RackAcceptanceMonitor, pscm_status_supported
 from opendbc.car.volvo.values import CAR, DBC, VolvoC1PlatformConfig
 
 GearShifter = structs.CarState.GearShifter
@@ -12,6 +12,15 @@ SPEED_TO_MS = 0.003977 # Must match VOLVO_SPEED_TO_MS in opendbc/safety/modes/vo
 STEERING_PRESSED_THRESHOLD = 2
 AOL_ENTRY_WINDOW_FRAMES = 50  # 0.5s at 100 Hz
 AOL_ALTERNATIVE_EXPERIENCE = 32  # set on CarParams when the AOL policy admits the car
+RELAYED_MAIN = ('LCA', 'LCA_2', 'LCA_3', 'LCA_4', 'LCA_5')
+RELAYED_PARTY = ('PSCM', 'PSCM_RELATED')
+
+
+def frames_since_last_update(cp: CANParser, name: str) -> list[dict[str, float]]:
+  values = cp.vl[name]
+  all_values = cp.vl_all[name]
+  count = len(all_values[next(iter(values))]) if values else 0
+  return [{sig: all_values[sig][i] for sig in values} for i in range(count)]
 
 
 class CarState(CarStateBase):
@@ -34,6 +43,9 @@ class CarState(CarStateBase):
     self.msg_pscm_related = {}
     self.pscm_related_raw = b''
     self.msg_lca_4 = {}
+    self.stock_frames: dict[str, list[dict[str, float]]] = {name: [] for name in RELAYED_MAIN + RELAYED_PARTY}
+    self.lat_commanding = False
+    self.rack_monitor = RackAcceptanceMonitor()
     self.c1_msg_pscm = {}
     self.c1_lka_torque = 0
     self.c1_button_states = {
@@ -68,7 +80,8 @@ class CarState(CarStateBase):
     ret.steeringTorque = -cp_party.vl['DRIVER_INPUT']['STEERING_DRIVER_INPUT']  # Car right turn is negative, openpilot right turn is positive
     ret.steeringPressed = abs(ret.steeringTorque) > STEERING_PRESSED_THRESHOLD
     self.msg_pscm_related = cp_party.vl['PSCM_RELATED']
-    ret.steerFaultTemporary = not pscm_status_supported(self.msg_pscm_related, self.pscm_related_raw)
+    rack_refusing = self.rack_monitor.update(self.lat_commanding, int(self.msg_pscm_related['LCA_ENABLED_ECHO']))
+    ret.steerFaultTemporary = rack_refusing or not pscm_status_supported(self.msg_pscm_related, self.pscm_related_raw)
     self.eps_active = True  # Assume EPS is active for now
 
     cruise_raw = cp_pt.vl["BUS1_CRUISE_CONTROL"]["CRUISE_CONTROL_SPA_ENABLED"] == 1 # inverted (0 = cruise on, 1 = cruise off)
@@ -122,6 +135,8 @@ class CarState(CarStateBase):
     self.msg_lca_3 = cp_main.vl['LCA_3']
     self.msg_lca_4 = cp_main.vl['LCA_4']
     self.msg_lca_5 = cp_main.vl['LCA_5']
+    self.stock_frames = {name: frames_since_last_update(cp_main, name) for name in RELAYED_MAIN}
+    self.stock_frames.update({name: frames_since_last_update(cp_party, name) for name in RELAYED_PARTY})
 
     self.pilot_assist_engaged = cp_main.vl['LCA_2']['PILOT_ASSIST_ENGAGED'] == 1
 
