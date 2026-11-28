@@ -94,6 +94,7 @@ class Drive:
 
   def intent(self):
     owner = self.card.aol_card_intent
+    assert self.state is not None, "step() first"
     owner.update(self.state.as_reader(), now_ns=self.frame * FRAME_NS, fault_active=False)
     return owner
 
@@ -186,8 +187,7 @@ def _native_boundaries(card, safety):
   drive.hold(20, cruise=False)
   assert safety.aol_get_permission_mask() == 0
 
-  drive.tap()
-  assert drive.state.cruiseState.available
+  assert drive.tap().cruiseState.available
   assert safety.aol_get_permission_mask() == 1
   assert not safety.get_controls_allowed()
 

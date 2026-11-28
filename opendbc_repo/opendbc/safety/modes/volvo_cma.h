@@ -3,15 +3,11 @@
 #include "opendbc/safety/declarations.h"
 #include "opendbc/safety/modes/volvo_cma_integrity.h"
 
-// Volvo CMA/SPA receiver layout, safetyParam 0: XC40 Recharge, S60 Recharge, Polestar 2.
-// Polestar 2 is technically CMA, but appears to use the SPA DBC for CAN bus 1.
-// Selected by volvo_dispatch.h.
-
 // Volvo SPA CAN message addresses
-#define VOLVO_LCA_STEER           0x58U    // TX from VCU1 to PSCM, LCA steering command (0x58)
+#define VOLVO_LCA_STEER           0x58U   // TX from VCU1 to PSCM, LCA steering command (0x58)
 #define VOLVO_LCA_2               0x69U   // RX from BCM, brake pedal, cruise state
-#define VOLVO_SAS                 0x55U    // RX from SAS, steering angle sensor
-#define VOLVO_PSCM                0x16U    // RX from PSCM, driver steering input
+#define VOLVO_SAS                 0x55U   // RX from SAS, steering angle sensor
+#define VOLVO_PSCM                0x16U   // RX from PSCM, driver steering input
 #define VOLVO_GEAR_POSITION       0x80U   // RX from transmission, gear position
 #define VOLVO_DRIVER_INPUT        0x15U
 #define VOLVO_LCA_3               0x57U   // TX from VCU1 to PSCM
@@ -137,16 +133,6 @@ static uint8_t volvo_aol_permission(void) {
   return permission;
 }
 
-// Messages openpilot replaces while actively steering. While openpilot is sending
-// one, the stock version arriving on stock_bus must not also be forwarded. Panda
-// tracks when each was last allowed through volvo_cma_tx_hook and only blocks the stock
-// frame while that is recent, so the two sides can't disagree: if openpilot stops
-// sending (disengaged, lateral paused, or the process stalls) the stock frames flow
-// again within timeout_us instead of the address going silent.
-//
-// timeout_us is ~2.5x the longest gap between openpilot sends for that address:
-// long enough to ride through normal scheduling jitter, short enough that a stall
-// only drops a couple of frames before stock traffic takes over.
 typedef struct {
   uint32_t addr;
   int stock_bus;
@@ -165,6 +151,13 @@ static const VolvoReplacedMsg VOLVO_REPLACED_MSGS[VOLVO_REPLACED_MSG_CNT] = {
 };
 static uint32_t volvo_replaced_tx_ts[VOLVO_REPLACED_MSG_CNT];
 static bool volvo_replaced_tx_seen[VOLVO_REPLACED_MSG_CNT];
+
+// Hand every replaced address back to the stock frames
+static void volvo_replaced_release_all(void) {
+  for (uint8_t i = 0U; i < VOLVO_REPLACED_MSG_CNT; i++) {
+    volvo_replaced_tx_seen[i] = false;
+  }
+}
 
 static int volvo_replaced_msg_index(uint32_t addr) {
   int index = -1;
@@ -373,9 +366,13 @@ static bool volvo_cma_tx_hook(const CANPacket_t *msg) {
 
   // Only a replacement that is actually allowed onto the bus takes over from the
   // stock frame; a rejected one leaves the stock frame forwarding.
-  if (tx) {
-    const int index = volvo_replaced_msg_index(msg->addr);
-    if (index >= 0) {
+  const int index = volvo_replaced_msg_index(msg->addr);
+  if (index >= 0) {
+    if (!lateral_controls_allowed()) {
+      tx = false;
+      volvo_replaced_release_all();
+    }
+    if (tx) {
       volvo_replaced_tx_ts[index] = microsecond_timer_get();
       volvo_replaced_tx_seen[index] = true;
     }
@@ -385,11 +382,15 @@ static bool volvo_cma_tx_hook(const CANPacket_t *msg) {
 }
 
 // Each replaced address is marked .disable_static_blocking in VOLVO_TX_MSGS so this
-// hook decides forwarding instead of panda blocking it permanently from boot. See
-// VOLVO_REPLACED_MSGS for the timing rationale.
+// hook decides forwarding instead of panda blocking it permanently from boot.
 static bool volvo_cma_fwd_hook(int bus_num, int addr) {
   bool block_msg = false;
   const int index = volvo_replaced_msg_index((uint32_t)addr);
+  // Without lateral permission stock frames forward at once, and a replacement sent
+  // before permission was withdrawn can't block stock frames once it returns.
+  if ((index >= 0) && !lateral_controls_allowed()) {
+    volvo_replaced_release_all();
+  }
   if ((index >= 0) && (VOLVO_REPLACED_MSGS[index].stock_bus == bus_num) && volvo_replaced_tx_seen[index]) {
     const uint32_t elapsed = safety_get_ts_elapsed(microsecond_timer_get(), volvo_replaced_tx_ts[index]);
     block_msg = elapsed <= VOLVO_REPLACED_MSGS[index].timeout_us;

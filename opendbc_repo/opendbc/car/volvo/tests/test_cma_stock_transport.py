@@ -1,7 +1,8 @@
 """Inactive or stalled openpilot hands every replaced address back to the stock frames.
 
 openpilot sends nothing while lateral is inactive, and panda only blocks a stock frame
-while openpilot's replacement for that address is recent (volvo_cma.h VOLVO_REPLACED_MSGS).
+while it allows lateral and openpilot's replacement for that address is recent
+(volvo_cma.h VOLVO_REPLACED_MSGS).
 """
 from types import SimpleNamespace
 import pytest
@@ -20,8 +21,10 @@ def test_stock_frames_resume_when_openpilot_stops_sending(identity):
   replacement is recent, so stock frames flow again if openpilot disengages or stalls."""
   cp, ci = interface(identity)
   lib = libsafety_py.libsafety
+  lib.set_alternative_experience(0)  # don't inherit another test's AOL marking
   assert lib.set_safety_hooks(cp.safetyConfigs[0].safetyModel.raw, cp.safetyConfigs[0].safetyParam) == 0
   lib.init_tests()
+  lib.set_controls_allowed(True)
   for address, bus in STOCK_BUS.items():
     assert lib.safety_fwd_hook(bus, address) != -1, hex(address)
 
@@ -47,6 +50,38 @@ def test_stock_frames_resume_when_openpilot_stops_sending(identity):
   lib.set_timer(30000 + 100001)
   for address in sent:
     assert lib.safety_fwd_hook(STOCK_BUS[address], address) != -1, hex(address)
+
+
+@pytest.mark.parametrize('identity', CMA)
+def test_stock_frames_resume_on_the_next_frame_when_panda_cancels(identity):
+  """The car cancels cruise: panda withdraws lateral and hands every address back at once,
+  while openpilot hasn't seen the cancel yet and is still sending replacements."""
+  cp, ci = interface(identity)
+  lib = libsafety_py.libsafety
+  lib.set_alternative_experience(0)  # don't inherit another test's AOL marking
+  assert lib.set_safety_hooks(cp.safetyConfigs[0].safetyModel.raw, cp.safetyConfigs[0].safetyParam) == 0
+  lib.init_tests()
+  lib.set_controls_allowed(True)
+  cc = structs.CarControl.new_message()
+  cc.latActive = True
+
+  def cycle(frame):
+    now = 1_000_000_000 + frame * 10_000_000
+    lib.set_timer(frame * 10000)
+    incoming = sources(identity, frame=frame)
+    for msg in incoming:
+      lib.safety_rx_hook(packet(msg))
+    ci.update([(now, incoming)])
+    return ci.apply(cc.as_reader(), now)[1]
+
+  for frame in range(4):
+    assert all(lib.safety_tx_hook(packet(msg)) for msg in cycle(frame))
+  lib.set_controls_allowed(False)
+  for address, bus in STOCK_BUS.items():
+    assert lib.safety_fwd_hook(bus, address) != -1, hex(address)
+  output = cycle(4)
+  assert {msg[0] for msg in output} == {address for address, _ in REPLACED}
+  assert not any(lib.safety_tx_hook(packet(msg)) for msg in output)
 
 
 @pytest.mark.parametrize("fingerprint", [CAR.POLESTAR_2, CAR.VOLVO_XC40_RECHARGE])

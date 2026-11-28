@@ -198,6 +198,7 @@ def test_all_captures_identify_through_real_eliminator(identity):
 def test_ci_update_apply_native_engage_disengage_reengage(identity):
   cp, ci = interface(identity)
   lib = libsafety_py.libsafety
+  lib.set_alternative_experience(0)  # don't inherit another test's AOL marking
   assert lib.set_safety_hooks(cp.safetyConfigs[0].safetyModel.raw, cp.safetyConfigs[0].safetyParam) == 0
   lib.init_tests()
   cc = structs.CarControl.new_message()

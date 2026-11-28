@@ -78,6 +78,7 @@ def test_override_lca_stream_passes_safety_and_recovers(fingerprint, driver_torq
   cc = SimpleNamespace(latActive=True, actuators=_Actuators())
   safety = libsafety_py.libsafety
   config = cp.safetyConfigs[0]
+  safety.set_alternative_experience(0)  # don't inherit another test's AOL marking
   assert safety.set_safety_hooks(config.safetyModel.raw, config.safetyParam) == 0
   safety.init_tests()
   safety.set_controls_allowed(True)

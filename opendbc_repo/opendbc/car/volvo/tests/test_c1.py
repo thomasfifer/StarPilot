@@ -132,6 +132,7 @@ class TestVolvoC1Host(unittest.TestCase):
         cc.latActive = active
         cc.cruiseControl.cancel = True
         cc.actuators.steeringAngleDeg = 15
+        lib.set_alternative_experience(0)  # don't inherit another test's AOL marking
         assert lib.set_safety_hooks(cp.safetyConfigs[0].safetyModel.raw, cp.safetyConfigs[0].safetyParam) == 0
         lib.init_tests()
         lib.set_timer(0)

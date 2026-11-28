@@ -109,6 +109,9 @@ class TestVolvoCMA(common.CarSafetyTest):
     # the mid-bus DBC since most shared messages live there.
     self.packer = self.mid_packer
     self.safety = libsafety_py.libsafety
+    # libsafety is shared by every test in the process: another test's AOL marking would
+    # install the AOL policy, which then decides lateral permission instead of controls_allowed.
+    self.safety.set_alternative_experience(0)
     self.safety.set_safety_hooks(SAFETY_VOLVO, self.SAFETY_PARAM)
     self.safety.init_tests()
 
@@ -177,11 +180,13 @@ class TestVolvoCMA(common.CarSafetyTest):
     self.safety.set_desired_angle_last(0)
     self.assertFalse(self._tx(self._angle_cmd_msg(541)))
 
-  def test_angle_tx_follows_measurement_when_controls_disabled(self):
+  def test_angle_tx_is_rejected_when_controls_disabled(self):
+    """Without permission the stock LCA_5 forwards, so no replacement is allowed, not even
+    one at the measured angle (see test_replacements_are_rejected_without_lateral_permission)."""
     self._reset_angle_measurement(10)
     self.safety.set_controls_allowed(False)
 
-    self.assertTrue(self._tx(self._angle_cmd_msg(10)))
+    self.assertFalse(self._tx(self._angle_cmd_msg(10)))
     self.assertFalse(self._tx(self._angle_cmd_msg(20)))
 
   def test_angle_tx_rate_matches_controller_cadence(self):
@@ -213,6 +218,7 @@ class TestVolvoCMA(common.CarSafetyTest):
 
   def test_pscm_relay_cannot_invent_angle(self):
     self._reset_angle_measurement(10)
+    self.safety.set_controls_allowed(True)
     valid = self.mid_packer.make_can_msg_safety(
       "PSCM", VOLVO_MAIN_BUS, {"PSCM_ANGLE_SENSOR": 10})
     invalid = self.mid_packer.make_can_msg_safety(
@@ -266,6 +272,59 @@ class TestVolvoCMA(common.CarSafetyTest):
       self.assertTrue(self._tx_replacement(addr))
     self.safety.set_timer(1_000_000 + 150_000)
     self.assertTrue(self.safety.get_controls_allowed())
+    for addr, stock_bus in _REPLACED_STOCK_BUS.items():
+      self.assertEqual(FWD_BUS[stock_bus], self.safety.safety_fwd_hook(stock_bus, addr), hex(addr))
+
+  def test_replacements_are_rejected_without_lateral_permission(self):
+    """Without permission the stock frames own every replaced address: a replacement
+    would reach the receiver alongside the forwarded stock frame."""
+    self.safety.set_controls_allowed(False)
+    for addr, stock_bus in _REPLACED_STOCK_BUS.items():
+      self.assertFalse(self._tx_replacement(addr), hex(addr))
+      self.assertEqual(FWD_BUS[stock_bus], self.safety.safety_fwd_hook(stock_bus, addr), hex(addr))
+
+  def test_fwd_hook_hands_back_as_soon_as_permission_is_withdrawn(self):
+    """A cancel seen by panda (cruise off, brake) hands every address back on the next
+    stock frame instead of after timeout_us, and openpilot's copies still in flight are
+    rejected rather than duplicating the stock frames."""
+    self.safety.set_controls_allowed(True)
+    self.safety.set_timer(1_000_000)
+    for addr, stock_bus in _REPLACED_STOCK_BUS.items():
+      self.assertTrue(self._tx_replacement(addr))
+      self.assertEqual(-1, self.safety.safety_fwd_hook(stock_bus, addr), hex(addr))
+
+    self.safety.set_controls_allowed(False)
+    self.safety.set_timer(1_001_000)  # well inside every timeout_us
+    for addr, stock_bus in _REPLACED_STOCK_BUS.items():
+      self.assertEqual(FWD_BUS[stock_bus], self.safety.safety_fwd_hook(stock_bus, addr), hex(addr))
+      self.assertFalse(self._tx_replacement(addr), hex(addr))
+
+  def test_regaining_permission_needs_a_new_replacement(self):
+    """A replacement sent before permission was withdrawn must not block stock frames
+    once permission returns: only a new replacement takes over again."""
+    self.safety.set_controls_allowed(True)
+    self.safety.set_timer(1_000_000)
+    for addr in _REPLACED_STOCK_BUS:
+      self.assertTrue(self._tx_replacement(addr))
+    self.safety.set_controls_allowed(False)
+    self.assertEqual(VOLVO_PARTY_BUS, self.safety.safety_fwd_hook(VOLVO_MAIN_BUS, VOLVO_LCA_2))  # one stock frame releases all
+    self.safety.set_controls_allowed(True)
+    self.safety.set_timer(1_002_000)
+    for addr, stock_bus in _REPLACED_STOCK_BUS.items():
+      self.assertEqual(FWD_BUS[stock_bus], self.safety.safety_fwd_hook(stock_bus, addr), hex(addr))
+      self.assertTrue(self._tx_replacement(addr))
+      self.assertEqual(-1, self.safety.safety_fwd_hook(stock_bus, addr), hex(addr))
+
+  def test_rejected_replacement_releases_every_address(self):
+    """A replacement rejected for lack of permission also hands back addresses whose
+    stock frame hasn't arrived since, e.g. a 29 Hz LCA_4 between frames."""
+    self.safety.set_controls_allowed(True)
+    self.safety.set_timer(1_000_000)
+    for addr in _REPLACED_STOCK_BUS:
+      self.assertTrue(self._tx_replacement(addr))
+    self.safety.set_controls_allowed(False)
+    self.assertFalse(self._tx_replacement(VOLVO_LCA_STEER))
+    self.safety.set_controls_allowed(True)
     for addr, stock_bus in _REPLACED_STOCK_BUS.items():
       self.assertEqual(FWD_BUS[stock_bus], self.safety.safety_fwd_hook(stock_bus, addr), hex(addr))
 
@@ -517,6 +576,17 @@ class TestVolvoCMAAol(unittest.TestCase):
     self.step(10_000, request=0)
     self.safety.set_desired_angle_last(0)
     self.assertFalse(self.safety.safety_tx_hook(cmd), "no host request, no steering")
+
+  def test_aol_disarm_hands_stock_frames_back_at_once(self):
+    self.assertEqual(self.tap(), 1)
+    lca_2 = common.make_msg(VOLVO_PARTY_BUS, VOLVO_LCA_2)
+    self.assertTrue(self.safety.safety_tx_hook(lca_2))
+    self.assertEqual(-1, self.safety.safety_fwd_hook(VOLVO_MAIN_BUS, VOLVO_LCA_2))
+    # Tapping cruise again disarms. (Its rising edge alone is a normal engagement.)
+    self.step(1_000, cruise=True)
+    self.assertEqual(self.step(1_000, cruise=False), 0)
+    self.assertEqual(VOLVO_PARTY_BUS, self.safety.safety_fwd_hook(VOLVO_MAIN_BUS, VOLVO_LCA_2))
+    self.assertFalse(self.safety.safety_tx_hook(lca_2))
 
   def test_armed_aol_keeps_steering_through_brake_and_gas(self):
     pscm = self.mid_packer.make_can_msg_safety("PSCM", VOLVO_PARTY_BUS, {"PSCM_ANGLE_SENSOR": 0})

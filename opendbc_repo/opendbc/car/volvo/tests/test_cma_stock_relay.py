@@ -5,7 +5,7 @@ On a Polestar 2 drive (route 0000009c--c675d09699), sampling the newest stock fr
 openpilot's own fixed schedule repeated and then skipped LCA_2 counters whenever the
 stock 50 Hz clock drifted into phase with openpilot's 100 Hz loop (about every 5
 minutes). Each time, the rack stopped following LCA commands (LCA_ENABLED_ECHO 0) with
-no other fault, steering silently went away, and the car cancelled cruise seconds later.
+no other fault, steering silently went away, and the car canceled cruise seconds later.
 """
 import random
 from itertools import pairwise
@@ -52,6 +52,7 @@ def _run(identity, cycles, *, seed=0, stall_every=0):
   openpilot frame), so two stock frames land in one update."""
   cp, ci = interface(identity)
   lib = libsafety_py.libsafety
+  lib.set_alternative_experience(0)  # don't inherit another test's AOL marking
   assert lib.set_safety_hooks(cp.safetyConfigs[0].safetyModel.raw, cp.safetyConfigs[0].safetyParam) == 0
   lib.init_tests()
   arrivals = _stock_arrivals(cycles, seed)
